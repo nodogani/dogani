@@ -1,4 +1,4 @@
-# TodoShare — 사내망 옵시디언 todo 실시간 공유
+# Dogani — 사내망 옵시디언 todo 실시간 공유
 
 옵시디언 데일리 노트(`261030 금.md`)를 동료 PC 바탕화면 오버레이로 실시간(약 1초) 공유합니다. 클라이언트는 읽기 전용입니다.
 
@@ -14,8 +14,8 @@
 
 | 구분 | 복사할 폴더 | 실행 |
 |---|---|---|
-| 서버 (노트 작성자 PC) | `dist\TodoShareServer\` | `TodoShareServer.exe` |
-| 클라이언트 (보는 사람 PC) | `dist\TodoShareClient\` | `TodoShareClient.exe` |
+| 서버 (노트 작성자 PC) | `dist\DoganiServer\` | `DoganiServer.exe` |
+| 클라이언트 (보는 사람 PC) | `dist\DoganiClient\` | `DoganiClient.exe` |
 
 ### 스크립트 (Python 3.10+ 필요)
 
@@ -43,7 +43,7 @@
 
 ## API (읽기 전용, 클라이언트 전용)
 
-모든 요청에 `X-TodoShare-Key` 헤더가 있어야 하며, 없으면(웹브라우저 등) 403입니다.
+모든 요청에 `X-Dogani-Key` 헤더가 있어야 하며, 없으면(웹브라우저 등) 403입니다.
 
 | 경로 | 설명 |
 |---|---|
@@ -51,6 +51,6 @@
 | `GET /api/month?ym=2026-10` | 그 달의 날짜별 완료/전체 개수 |
 | `GET /api/events` | SSE. 노트 변경 `changed`, 일시 중지/재개 `status` |
 
-설정 파일: `%APPDATA%\TodoShare\server.json`, `client.json` (환경변수 `TODOSHARE_HOME` 으로 위치 변경 가능)
+설정 파일: `%APPDATA%\Dogani\server.json`, `client.json` (환경변수 `DOGANI_HOME` 으로 위치 변경 가능)
 
 > ⚠️ 클라이언트 프로그램이 있으면 사내망 누구나 접속할 수 있습니다(암호 없음). 원치 않는 접속자는 서버 트레이에서 차단하고, 잠깐 숨기고 싶을 때는 "공유 일시 중지"를 쓰세요.

@@ -25,8 +25,8 @@ from PySide6.QtWebEngineCore import (QWebEnginePage, QWebEngineScript, QWebEngin
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QApplication, QInputDialog, QLineEdit, QMessageBox, QVBoxLayout, QWidget
 
-APP_NAME = "TodoShareClient"
-CONFIG_DIR = os.environ.get("TODOSHARE_HOME") or os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "TodoShare")
+APP_NAME = "DoganiClient"
+CONFIG_DIR = os.environ.get("DOGANI_HOME") or os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Dogani")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "client.json")
 BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))  # exe 패키징 시 _MEIPASS
 UI_DIR = os.path.join(BASE_DIR, "ui")
@@ -34,9 +34,9 @@ DEFAULT_PORT = 8765
 OPACITY_LEVELS = [100, 90, 80, 70, 60]
 
 # 서버가 클라이언트 프로그램인지 확인하는 헤더 (서버의 CLIENT_KEY 와 같아야 함)
-KEY_HEADER = b"X-TodoShare-Key"
-HOST_HEADER = b"X-TodoShare-Host"
-CLIENT_KEY = b"todoshare-client-v1"
+KEY_HEADER = b"X-Dogani-Key"
+HOST_HEADER = b"X-Dogani-Host"
+CLIENT_KEY = b"dogani-client-v1"
 
 STATUS_LABELS = {
     "online": "서버 접속 중",
@@ -267,8 +267,8 @@ class Bridge(QObject):
 
 
 # file:// 로 열면 서버(http) 접근이 막히고, LocalContentCanAccessRemoteUrls 를 켜면 로컬 css/js 로딩이 깨진다.
-# 그래서 UI 파일은 전용 스킴(todoshare://ui/...)으로 제공한다.
-UI_SCHEME = b"todoshare"
+# 그래서 UI 파일은 전용 스킴(dogani://ui/...)으로 제공한다.
+UI_SCHEME = b"dogani"
 MIME_TYPES = {".html": b"text/html", ".js": b"text/javascript", ".css": b"text/css",
               ".svg": b"image/svg+xml", ".png": b"image/png"}
 
@@ -339,7 +339,7 @@ class Overlay(QWidget):
         self.nav_size = QSize(200, 48)
         self.save_timer = QTimer(self, singleShot=True, interval=800, timeout=lambda: save_config(self.cfg))
 
-        self.setWindowTitle("TodoShare")
+        self.setWindowTitle("Dogani")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.apply_flags()
 
@@ -377,7 +377,7 @@ class Overlay(QWidget):
         # 탐색기 재시작 등으로 바탕화면 창이 바뀌면 다시 고정
         self.pin_timer = QTimer(self, interval=5000, timeout=self.apply_pin)
         self.pin_timer.start()
-        self.view.load(QUrl("todoshare://ui/index.html"))
+        self.view.load(QUrl("dogani://ui/index.html"))
 
     # -- window flags
     def apply_flags(self):
@@ -513,7 +513,7 @@ class ClientApp(QObject):
 
 
 def single_instance():
-    handle = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\TodoShareClientMutex")
+    handle = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\DoganiClientMutex")
     if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
         return None
     return handle

@@ -24,8 +24,8 @@ from urllib.parse import parse_qs, urlparse
 import pystray
 from PIL import Image, ImageDraw
 
-APP_NAME = "TodoShareServer"
-CONFIG_DIR = os.environ.get("TODOSHARE_HOME") or os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "TodoShare")
+APP_NAME = "DoganiServer"
+CONFIG_DIR = os.environ.get("DOGANI_HOME") or os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Dogani")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "server.json")
 DEFAULT_PORT = 8765
 POLL_INTERVAL = 1.0      # 파일 변경 감시 주기(초)
@@ -37,9 +37,9 @@ FILE_PATTERNS = [
     (re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[\s_].*)?\.md$", re.I), lambda m: (int(m[1]), int(m[2]), int(m[3]))),
 ]
 # 클라이언트 프로그램 식별용 헤더 (보안 인증이 아니라 "브라우저로 그냥 열람"을 막는 용도)
-KEY_HEADER = "X-TodoShare-Key"
-HOST_HEADER = "X-TodoShare-Host"
-CLIENT_KEY = "todoshare-client-v1"
+KEY_HEADER = "X-Dogani-Key"
+HOST_HEADER = "X-Dogani-Host"
+CLIENT_KEY = "dogani-client-v1"
 TASK_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+\[(.)\]")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
@@ -299,7 +299,7 @@ class Hub:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "TodoShare/1.0"
+    server_version = "Dogani/1.0"
     app: "App" = None
 
     def log_message(self, *args):
@@ -327,7 +327,7 @@ class Handler(BaseHTTPRequestHandler):
         app = self.app
         # 클라이언트 프로그램만 접속 허용 (웹브라우저로 주소만 쳐서 보는 것을 막음)
         if self.headers.get(KEY_HEADER) != CLIENT_KEY:
-            self._send_json({"error": "client_only", "message": "TodoShare 클라이언트로만 볼 수 있습니다."}, 403)
+            self._send_json({"error": "client_only", "message": "Dogani 클라이언트로만 볼 수 있습니다."}, 403)
             return
         if app.hub.is_blocked(ip):
             self._send_json({"error": "blocked"}, 403)
