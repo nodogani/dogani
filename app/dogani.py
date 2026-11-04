@@ -1,5 +1,5 @@
 """
-Dogani - 사내망 옵시디언 todo 실시간 공유 (서버 + 뷰어 통합)
+dogani - 사내망 todo 실시간 공유 (서버 + 뷰어 통합)
 
 - 내 노트: todo 폴더를 공유 서버로 열고(server.py), 바탕화면 오버레이에서 보고 바로 편집
 - 다른 사람 노트: 동료의 Dogani 주소를 추가하면 각각 오버레이(네비게이션 바)가 하나씩 생김 (읽기 전용)
@@ -391,6 +391,25 @@ class Bridge(QObject):
     @Slot(str)
     def setName(self, name):
         self.win.label = name or self.win.server
+        if name:
+            self.win.app.names[self.win.key] = name
+
+    @Slot(str)
+    def togglePanel(self, mode):
+        if mode in ("note", "cal"):
+            self.win.app.toggle_panel(self.win.key, mode)
+
+    @Slot()
+    def closePanel(self):
+        self.win.app.close_panel(self.win.key, self.win.mode)
+
+    @Slot(str)
+    def openNote(self, date):
+        self.win.app.open_note(self.win.key, date)
+
+    @Slot(str)
+    def noteDateChanged(self, date):
+        self.win.app.note_date_changed(self.win.key, date)
 
     @Slot(str)
     def openUrl(self, url):
@@ -476,22 +495,28 @@ def setup_profile(parent):
     profile.scripts().insert(script)
 
 
+PANEL_DEFAULT_SIZE = {"note": (440, 640), "cal": (400, 420)}
+PANEL_MIN_SIZE = {"note": (400, 300), "cal": (340, 300)}
+
+
 class Overlay(QWidget):
-    """노트 하나(내 노트 또는 다른 사람)를 보여주는 바탕화면 오버레이 창."""
+    """바탕화면 오버레이 창. 노트 하나(내 노트 또는 다른 사람)마다
+    네비게이션 바(mode="nav") 하나와, 따로 열고 닫는 할일(note)·달력(cal) 창이 있다."""
 
     status_changed = Signal(str, str)
 
-    def __init__(self, app, key, server, index):
+    def __init__(self, app, key, server, index, mode="nav"):
         super().__init__()
         self.app = app
         self.key = key
         self.server = server
+        self.mode = mode
         self.label = "내 노트" if key == ME else server
         self.index = index
         self.expanded = False
         self.nav_size = QSize(200, 60)
 
-        self.setWindowTitle(f"Dogani - {self.label}")
+        self.setWindowTitle(f"Dogani - {self.label}" + {"note": " 할일", "cal": " 달력"}.get(mode, ""))
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.apply_flags()
 
@@ -520,11 +545,19 @@ class Overlay(QWidget):
 
     @property
     def ocfg(self):
-        return self.app.overlay_cfg(self.key)
+        """이 창의 위치·크기 설정 (네비게이션 바는 노트 설정 그대로, 할일/달력 창은 그 아래 하위 항목)"""
+        ocfg = self.app.overlay_cfg(self.key)
+        if self.mode == "nav":
+            return ocfg
+        return self.app.panel_cfg(self.key, self.mode)
 
     def js_config(self):
-        return {"server": self.server, "theme": self.app.cfg["theme"], "mine": self.key == ME,
-                "label": "내 노트" if self.key == ME else ""}
+        label = "내 노트" if self.key == ME else self.app.names.get(self.key, "")
+        cfg = {"server": self.server, "theme": self.app.cfg["theme"], "mine": self.key == ME,
+               "label": label, "mode": self.mode, "open": self.app.open_panels(self.key)}
+        if self.mode == "note":
+            cfg["date"] = self.ocfg.pop("date", None)
+        return cfg
 
     # -- window flags
     def apply_flags(self):
@@ -555,6 +588,14 @@ class Overlay(QWidget):
         if pos and QGuiApplication.screenAt(QPoint(pos[0] + 30, pos[1] + 20)):
             self.move(pos[0], pos[1])
             return
+        nav = self.app.overlays.get(self.key)
+        if self.mode != "nav" and nav:
+            # 처음 여는 창은 네비게이션 바 바로 아래: 할일 창은 그대로, 달력 창은 할일 창 자리 왼쪽
+            w = (self.ocfg.get("panel") or PANEL_DEFAULT_SIZE[self.mode])[0]
+            x = nav.x() - (w - 10 if self.mode == "cal" else 0)
+            self.move(x, nav.y() + nav.height() - 10)
+            self.keep_on_screen(nav.pos())
+            return
         # 처음 뜨는 창은 화면 오른쪽 위부터 아래로 차례대로
         geo = QGuiApplication.primaryScreen().availableGeometry()
         self.move(geo.right() - 280, geo.top() + 20 + self.index * 56)
@@ -569,16 +610,18 @@ class Overlay(QWidget):
     def set_expanded(self, expanded):
         self.expanded = expanded
         if expanded:
-            w, h = self.ocfg.get("panel") or [440, 640]
-            self.setMinimumSize(max(400, self.nav_size.width()), 300)  # 네비게이션 바에 날짜 이동이 들어가므로
-            self.resize(max(w, self.nav_size.width()), h)
+            w, h = self.ocfg.get("panel") or PANEL_DEFAULT_SIZE.get(self.mode, (440, 640))
+            mw, mh = PANEL_MIN_SIZE.get(self.mode, (400, 300))  # 상단 바에 날짜 이동이 들어가므로
+            self.setMinimumSize(mw, mh)
+            self.resize(max(w, mw), max(h, mh))
             self.keep_on_screen()
         else:
             self.setMinimumSize(0, 0)
             self.resize(self.nav_size)
 
-    def keep_on_screen(self):
-        screen = QGuiApplication.screenAt(self.pos() + QPoint(30, 20)) or QGuiApplication.primaryScreen()
+    def keep_on_screen(self, anchor=None):
+        anchor = anchor if anchor is not None else self.pos()
+        screen = QGuiApplication.screenAt(anchor + QPoint(30, 20)) or QGuiApplication.primaryScreen()
         geo = screen.availableGeometry()
         x = min(self.x(), geo.right() - self.width() + 1)
         y = min(self.y(), geo.bottom() - self.height() + 1)
@@ -606,7 +649,9 @@ class DoganiApp(QObject):
         self.qapp = qapp
         self.cfg = cfg
         self.status = {}    # 키 -> online/offline/...
-        self.overlays = {}  # 키 -> Overlay
+        self.overlays = {}  # 키 -> Overlay (네비게이션 바)
+        self.panels = {}    # (키, "note" | "cal") -> Overlay (할일/달력 창)
+        self.names = {}     # 키 -> 상대 PC 이름
         self.save_timer = QTimer(self, singleShot=True, interval=800, timeout=lambda: save_config(self.cfg))
         setup_profile(self)
 
@@ -634,6 +679,66 @@ class DoganiApp(QObject):
     def keys(self):
         return [ME] + list(self.cfg["servers"])
 
+    def windows(self):
+        return list(self.overlays.values()) + list(self.panels.values())
+
+    # -- 할일/달력 창 (네비게이션 바 버튼으로 각각 따로 열고 닫음)
+    def panel_cfg(self, key, mode):
+        return self.overlay_cfg(key).setdefault(mode, {"open": False, "pos": None, "panel": None})
+
+    def open_panels(self, key):
+        return {m: (key, m) in self.panels for m in ("note", "cal")}
+
+    def show_panel(self, key, mode):
+        self.panel_cfg(key, mode)["open"] = True
+        win = self.panels.get((key, mode))
+        if not win:
+            win = Overlay(self, key, self.server_of(key), 0, mode)
+            self.panels[(key, mode)] = win
+        win.show()
+        win.raise_()
+        self.push_open(key)
+        self.save_later()
+        return win
+
+    def close_panel(self, key, mode, forget=True):
+        win = self.panels.pop((key, mode), None)
+        if forget:
+            self.panel_cfg(key, mode)["open"] = False
+        if win:
+            win.close()
+            win.deleteLater()
+        self.push_open(key)
+        self.save_later()
+
+    def toggle_panel(self, key, mode):
+        if (key, mode) in self.panels:
+            self.close_panel(key, mode)
+        else:
+            self.show_panel(key, mode)
+
+    def push_open(self, key):
+        opened = self.open_panels(key)
+        for win in (self.overlays.get(key), self.panels.get((key, "cal"))):
+            if win:
+                win.push_config(open=opened)
+
+    def open_note(self, key, date):
+        """달력에서 날짜 클릭 → 할일 창을 열고(이미 열려 있으면 그대로) 그 날짜로"""
+        win = self.panels.get((key, "note"))
+        if win:
+            win.show()
+            win.raise_()
+            win.view.page().runJavaScript(f"window.App && App.showDate({json.dumps(date)})")
+        else:
+            self.panel_cfg(key, "note")["date"] = date
+            self.show_panel(key, "note")
+
+    def note_date_changed(self, key, date):
+        cal = self.panels.get((key, "cal"))
+        if cal:
+            cal.push_config(noteDate=date)
+
     def ensure_overlay(self, key):
         ov = self.overlays.get(key)
         if not ov:
@@ -646,8 +751,14 @@ class DoganiApp(QObject):
         self.overlay_cfg(key)["visible"] = visible
         if visible:
             self.ensure_overlay(key).show()
-        elif key in self.overlays:
-            self.overlays[key].hide()
+            for mode in ("note", "cal"):
+                if self.panel_cfg(key, mode).get("open"):
+                    self.show_panel(key, mode)
+        else:
+            if key in self.overlays:
+                self.overlays[key].hide()
+            for mode in ("note", "cal"):
+                self.close_panel(key, mode, forget=False)  # 다시 표시하면 열려 있던 창도 다시 연다
 
     def start(self):
         self.tray.update()
@@ -694,8 +805,11 @@ class DoganiApp(QObject):
             return
         if addr in self.cfg["servers"]:
             self.cfg["servers"].remove(addr)
+        for mode in ("note", "cal"):
+            self.close_panel(addr, mode)
         self.cfg["overlays"].pop(addr, None)
         self.status.pop(addr, None)
+        self.names.pop(addr, None)
         ov = self.overlays.pop(addr, None)
         if ov:
             ov.close()
@@ -726,15 +840,15 @@ class DoganiApp(QObject):
             self.browse_dir()
         elif name == "set_on_top":
             cfg["on_top"] = arg
-            for ov in self.overlays.values():
+            for ov in self.windows():
                 ov.apply_flags()
         elif name == "opacity":
             cfg["opacity"] = arg
-            for ov in self.overlays.values():
+            for ov in self.windows():
                 ov.setWindowOpacity(arg / 100)
         elif name == "toggle_theme":
             cfg["theme"] = "light" if cfg["theme"] == "dark" else "dark"
-            for ov in self.overlays.values():
+            for ov in self.windows():
                 ov.push_config(theme=cfg["theme"])
         elif name == "toggle_autostart":
             set_autostart(not is_autostart())

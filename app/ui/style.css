@@ -115,6 +115,10 @@ body.expanded #nav { display: flex; align-self: stretch; }
   padding: 0;
 }
 .nav-btn:hover { background: var(--bg-hover); }
+/* 네비게이션 바: 할일/달력 버튼만, 할일/달력 창: 닫기 버튼만 */
+#btn-close { display: none; }
+body.panel-window #btn-note, body.panel-window #btn-cal { display: none; }
+body.panel-window #btn-close { display: grid; }
 .nav-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 .nav-btn svg {
   width: 16px;
@@ -406,7 +410,7 @@ body.writable #note-body { cursor: text; }
 .cal-grid {
   flex: 1;
   display: grid;
-  grid-template-columns: repeat(7, 1fr);
+  grid-template-columns: repeat(7, minmax(0, 1fr));  /* 1fr 만 쓰면 개수 글자가 긴 열만 넓어짐 */
   grid-template-rows: auto repeat(6, minmax(0, 1fr));
   gap: 3px;
   padding: 8px 10px 4px;
@@ -423,8 +427,9 @@ body.writable #note-body { cursor: text; }
 .cal-grid .wd.sun, .cal-day.sun .num { color: var(--sun); }
 .cal-grid .wd.sat, .cal-day.sat .num { color: var(--sat); }
 .cal-day {
+  min-width: 0;
   border-radius: 8px;
-  padding: 4px 6px;
+  padding: 4px 4px;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
@@ -439,10 +444,14 @@ body.writable #note-body { cursor: text; }
 .cal-day .num { font-size: 12px; font-weight: 600; }
 .cal-day .count {
   align-self: flex-end;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: clip;
+  white-space: nowrap;
   font-size: 12px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
-  padding: 0 6px;
+  padding: 0 4px;
   border-radius: 8px;
   background: color-mix(in srgb, var(--accent) 15%, transparent);
   color: var(--accent);

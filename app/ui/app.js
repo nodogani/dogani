@@ -38,6 +38,7 @@
     base: "",
     label: "",         // 네비게이션 바 이름 (내 노트 / 상대 PC 이름)
     mine: false,
+    mode: "nav",       // 이 창의 역할: nav(네비게이션 바) | note(할일 창) | cal(달력 창)
     view: null,        // null | "note" | "cal"
     today: iso(new Date()),
     noteDate: iso(new Date()),
@@ -264,6 +265,7 @@
     state.noteDate = date;
     setView("note");
     loadNote(false);
+    if (bridge && state.mode === "note") bridge.noteDateChanged(date);
   }
 
   // ------------------------------------------------------------ edit (내 노트 전용)
@@ -629,16 +631,34 @@
     if (state.view === "cal") loadMonth();
   }
 
+  /** 네비게이션 바 버튼 불빛 = 할일/달력 창이 열려 있는지 */
+  function setOpen(open) {
+    $("btn-note").classList.toggle("active", !!open.note);
+    $("btn-cal").classList.toggle("active", !!open.cal);
+  }
+
+  function showCal() {
+    state.calYM = state.noteDate.slice(0, 7);
+    setView("cal");
+    loadMonth();
+  }
+
   // ------------------------------------------------------------ events
+  // 네비게이션 바의 할일/달력 버튼은 각각 따로 창을 열고 닫는다 (브라우저 테스트에서는 한 창 안에서 전환)
   $("btn-note").addEventListener("click", () => {
+    if (bridge) return bridge.togglePanel("note");
     if (state.view === "note") return setView(null);
     showNote(state.view ? state.noteDate : state.today);
   });
   $("btn-cal").addEventListener("click", () => {
+    if (bridge) return bridge.togglePanel("cal");
     if (state.view === "cal") return setView(null);
-    state.calYM = state.noteDate.slice(0, 7);
-    setView("cal");
-    loadMonth();
+    showCal();
+  });
+  $("btn-close").addEventListener("click", () => {
+    exitEdit();
+    // 닫기 전에 저장이 끝나도록
+    saveChain.then(() => { if (bridge) bridge.closePanel(); });
   });
   $("note-prev").addEventListener("click", () => showNote(addDays(state.noteDate, -1)));
   $("note-next").addEventListener("click", () => showNote(addDays(state.noteDate, 1)));
@@ -684,7 +704,15 @@
   $("cal-today").addEventListener("click", () => { state.calYM = state.today.slice(0, 7); loadMonth(); });
   $("cal-grid").addEventListener("click", (e) => {
     const cell = e.target.closest(".cal-day");
-    if (cell) showNote(cell.dataset.date);
+    if (!cell) return;
+    if (bridge && state.mode === "cal") {
+      state.noteDate = cell.dataset.date;
+      for (const c of $("cal-grid").querySelectorAll(".cal-day.selected")) c.classList.remove("selected");
+      cell.classList.add("selected");
+      bridge.openNote(cell.dataset.date);
+    } else {
+      showNote(cell.dataset.date);
+    }
   });
 
   $("nav").addEventListener("mousedown", (e) => {
@@ -724,7 +752,22 @@
         setLabel(cfg.label || (cfg.server ? cfg.server.replace(new RegExp(":" + DEFAULT_PORT + "$"), "") : "주소 미지정"));
         connect();
       }
+      if (cfg.open) setOpen(cfg.open);
+      if (cfg.mode && cfg.mode !== state.mode) {
+        state.mode = cfg.mode;
+        document.body.classList.toggle("panel-window", cfg.mode !== "nav");
+        if (cfg.mode === "note") showNote(cfg.date || state.today);
+        else if (cfg.mode === "cal") showCal();
+      }
+      if (cfg.noteDate && state.mode === "cal") {
+        state.noteDate = cfg.noteDate;
+        loadMonth();
+      }
       reportNavSize();
+    },
+    /** 파이썬에서 호출: 달력 창에서 고른 날짜를 할일 창에 표시 */
+    showDate(date) {
+      if (state.mode === "note") showNote(date);
     },
   };
 
