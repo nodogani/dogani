@@ -65,6 +65,7 @@ html, body {
   gap: 6px;
 }
 body.expanded #root { align-items: stretch; }
+body.expanded #nav { display: flex; align-self: stretch; }
 
 /* ------------------------------------------------------------ nav */
 #nav {
@@ -138,6 +139,15 @@ body.expanded #root { align-items: stretch; }
 .view { display: flex; flex-direction: column; height: 100%; }
 .view[hidden], #panel[hidden], .progress-row[hidden] { display: none; }
 
+.nav-date {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.nav-date[hidden] { display: none; }
+.nav-date .header-title.is-today { color: var(--accent); }
 .view-header {
   display: flex;
   align-items: center;
@@ -165,6 +175,26 @@ body.expanded #root { align-items: stretch; }
 .icon-btn { width: 28px; height: 26px; font-size: 20px; line-height: 1; }
 .text-btn { height: 26px; padding: 0 8px; font-size: 12px; border: 1px solid var(--border); }
 .icon-btn:hover, .text-btn:hover { background: var(--bg-hover); }
+.text-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* 편집 모드 (서버 주인 전용) */
+#note-editor {
+  flex: 1;
+  margin: 6px 10px;
+  padding: 8px 10px;
+  resize: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--code-bg);
+  color: var(--text);
+  font: 13px/1.55 Consolas, "D2Coding", monospace;
+  outline: none;
+  tab-size: 4;
+  user-select: text;
+}
+#note-editor:focus { border-color: var(--accent); }
+body.writable .task-checkbox { cursor: pointer; }
+body.writable #note-body { cursor: text; }
 
 .progress-row {
   display: flex;

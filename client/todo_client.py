@@ -32,6 +32,7 @@ BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))) 
 UI_DIR = os.path.join(BASE_DIR, "ui")
 DEFAULT_PORT = 8765
 OPACITY_LEVELS = [100, 90, 80, 70, 60]
+OWNER_MODE = None  # 서버가 --owner 로 띄운 경우 {"port", "parent"}
 
 # 서버가 클라이언트 프로그램인지 확인하는 헤더 (서버의 CLIENT_KEY 와 같아야 함)
 KEY_HEADER = b"X-Dogani-Key"
@@ -195,6 +196,19 @@ class Tray(QObject):
         Item = pystray.MenuItem
         cfg = self.app.cfg
         status = self.app.status
+        if OWNER_MODE:  # 서버가 띄운 내 오버레이: 서버 변경·자동 실행은 서버 트레이에서 관리
+            return [
+                Item(f"내 오버레이 ({STATUS_LABELS[status]})", None, enabled=False),
+                Item("오버레이 표시", self.emit("toggle_visible"), checked=lambda i: cfg["visible"], default=True),
+                Item("바탕화면에 고정", self.emit("set_on_top", False), checked=lambda i: not cfg["on_top"], radio=True),
+                Item("항상 위에 표시", self.emit("set_on_top", True), checked=lambda i: cfg["on_top"], radio=True),
+                Item("투명도", pystray.Menu(*[
+                    Item(f"{level}%", self.emit("opacity", level),
+                         checked=lambda i, lv=level: cfg["opacity"] == lv, radio=True)
+                    for level in OPACITY_LEVELS
+                ])),
+                Item("다크 테마", self.emit("toggle_theme"), checked=lambda i: cfg["theme"] == "dark"),
+            ]
         return [
             Item(STATUS_LABELS[status], pystray.Menu(
                 Item(cfg["server"] or "(서버 미지정)", None, enabled=False),
@@ -217,7 +231,8 @@ class Tray(QObject):
 
     def set_status(self, status):
         self.icon.icon = make_icon_image(status == "online")
-        self.icon.title = f"todo 클라이언트 - {self.app.cfg['server']} ({STATUS_LABELS[status]})"
+        name = "내 오버레이" if OWNER_MODE else "todo 클라이언트"
+        self.icon.title = f"{name} - {self.app.cfg['server']} ({STATUS_LABELS[status]})"
 
     def start(self):
         self.icon.run_detached()
@@ -422,7 +437,7 @@ class Overlay(QWidget):
         self.expanded = expanded
         if expanded:
             w, h = self.cfg["panel"]
-            self.setMinimumSize(max(300, self.nav_size.width()), 280)
+            self.setMinimumSize(max(380, self.nav_size.width()), 280)  # 네비게이션 바에 날짜 이동이 들어가므로
             self.resize(max(w, self.nav_size.width()), h)
             self.keep_on_screen()
         else:
@@ -471,6 +486,19 @@ class ClientApp(QObject):
             self.overlay.show()
         if not self.cfg["server"]:
             QTimer.singleShot(300, self.change_server)
+        if OWNER_MODE and OWNER_MODE["parent"]:
+            # 서버가 종료되면 같이 종료
+            self.parent_timer = QTimer(self, interval=2000, timeout=self.check_parent)
+            self.parent_timer.start()
+
+    def check_parent(self):
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x00100000, False, OWNER_MODE["parent"])  # SYNCHRONIZE
+        alive = bool(h) and k32.WaitForSingleObject(h, 0) == 0x102  # WAIT_TIMEOUT
+        if h:
+            k32.CloseHandle(h)
+        if not alive:
+            self.on_command("quit", None)
 
     def on_status(self, status):
         self.status = status
@@ -512,8 +540,8 @@ class ClientApp(QObject):
         save_config(cfg)
 
 
-def single_instance():
-    handle = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\DoganiClientMutex")
+def single_instance(name="DoganiClientMutex"):
+    handle = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\" + name)
     if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
         return None
     return handle
@@ -522,19 +550,32 @@ def single_instance():
 def main():
     parser = argparse.ArgumentParser(description="todo 공유 클라이언트")
     parser.add_argument("--server", help=f"서버 주소 (IP 또는 IP:포트, 기본 포트 {DEFAULT_PORT})")
+    parser.add_argument("--owner", type=int, metavar="PORT", help="서버가 띄우는 서버 주인용 오버레이 (내부용)")
+    parser.add_argument("--parent", type=int, default=0, help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    global CONFIG_PATH, OWNER_MODE
+    if args.owner:
+        # 서버 주인 모드: 설정 파일·중복 실행 검사를 일반 클라이언트와 분리 (같은 PC 에서 둘 다 실행 가능)
+        CONFIG_PATH = os.path.join(CONFIG_DIR, "owner.json")
+        OWNER_MODE = {"port": args.owner, "parent": args.parent}
 
     register_ui_scheme()
     qapp = QApplication(sys.argv)
     qapp.setQuitOnLastWindowClosed(False)
 
-    mutex = single_instance()
+    mutex = single_instance("DoganiOwnerMutex" if OWNER_MODE else "DoganiClientMutex")
+    if mutex is None and OWNER_MODE:
+        return
     if mutex is None:
         QMessageBox.information(None, APP_NAME, "클라이언트가 이미 실행 중입니다.\n시스템 트레이를 확인하세요.")
         return
 
     cfg = load_config()
-    if args.server:
+    if OWNER_MODE:
+        cfg["server"] = f"127.0.0.1:{args.owner}"
+        cfg["visible"] = True
+    elif args.server:
         cfg["server"] = normalize_server(args.server)
         save_config(cfg)
 

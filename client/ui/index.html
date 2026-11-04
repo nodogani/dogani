@@ -10,6 +10,19 @@
     <nav id="nav" title="드래그해서 이동">
       <span id="status-dot" class="dot"></span>
       <span id="server-label">서버 미지정</span>
+      <!-- 펼쳤을 때 네비게이션 바 안에 날짜 이동 표시 -->
+      <div class="nav-date" id="note-header" hidden>
+        <button class="icon-btn" id="note-prev" title="이전 날">&#x2039;</button>
+        <div class="header-title" id="note-title"></div>
+        <button class="icon-btn" id="note-next" title="다음 날">&#x203A;</button>
+        <button class="text-btn" id="note-today">오늘</button>
+      </div>
+      <div class="nav-date" id="cal-header" hidden>
+        <button class="icon-btn" id="cal-prev" title="이전 달">&#x2039;</button>
+        <div class="header-title" id="cal-title"></div>
+        <button class="icon-btn" id="cal-next" title="다음 달">&#x203A;</button>
+        <button class="text-btn" id="cal-today">오늘</button>
+      </div>
       <button id="btn-note" class="nav-btn" title="오늘의 노트">
         <svg viewBox="0 0 24 24"><path d="M9 11l3 3 8-8"/><path d="M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"/></svg>
       </button>
@@ -21,29 +34,17 @@
     <section id="panel" hidden>
       <!-- 노트 보기 -->
       <div id="view-note" class="view" hidden>
-        <header class="view-header">
-          <button class="icon-btn" id="note-prev" title="이전 날">&#x2039;</button>
-          <div class="header-title" id="note-title"></div>
-          <button class="icon-btn" id="note-next" title="다음 날">&#x203A;</button>
-          <button class="text-btn" id="note-today">오늘</button>
-        </header>
         <div class="progress-row" id="note-progress" hidden>
           <div class="progress"><div class="progress-bar" id="note-bar"></div></div>
           <span class="progress-text" id="note-count"></span>
         </div>
-        <div class="notice" id="note-notice" hidden></div>
         <article id="note-body" class="markdown-rendered"></article>
+        <textarea id="note-editor" spellcheck="false" hidden></textarea>
         <footer class="view-footer" id="note-footer"></footer>
       </div>
 
       <!-- 달력 보기 -->
       <div id="view-cal" class="view" hidden>
-        <header class="view-header">
-          <button class="icon-btn" id="cal-prev" title="이전 달">&#x2039;</button>
-          <div class="header-title" id="cal-title"></div>
-          <button class="icon-btn" id="cal-next" title="다음 달">&#x203A;</button>
-          <button class="text-btn" id="cal-today">오늘</button>
-        </header>
         <div id="cal-grid" class="cal-grid"></div>
         <footer class="view-footer" id="cal-footer"></footer>
       </div>
