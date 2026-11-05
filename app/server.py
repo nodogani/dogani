@@ -16,6 +16,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+import schedule
+
 POLL_INTERVAL = 1.0      # 파일 변경 감시 주기(초)
 HEARTBEAT_INTERVAL = 15  # SSE keep-alive 주기(초)
 
@@ -78,24 +80,39 @@ class NoteStore:
         self.root = ""
         self.files = {}    # date -> (path, mtime_ns, size)
         self.summary = {}  # date -> (done, total)
+        self.blank = set()       # 내용이 빈 노트 날짜 (어제 노트 복사 대상에서 뺌)
+        self.sched_files = {}    # path -> (mtime_ns, size)
+        self.events = []         # 일정 파일에서 읽은 일정
+        self.sched_changed = False
 
     def set_root(self, root):
         with self.lock:
             self.root = root
             self.files = {}
             self.summary = {}
+            self.blank = set()
+            self.sched_files = {}
+            self.events = []
 
     def has_root(self):
         with self.lock:
             return bool(self.root) and os.path.isdir(self.root)
 
     def _scan(self, root):
-        found = {}
+        found, sched = {}, {}
         if not root or not os.path.isdir(root):
-            return found
+            return found, sched
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if not d.startswith(".")]
             for name in filenames:
+                if schedule.is_schedule_file(name):
+                    path = os.path.join(dirpath, name)
+                    try:
+                        st = os.stat(path)
+                        sched[path] = (st.st_mtime_ns, st.st_size)
+                    except OSError:
+                        pass
+                    continue
                 d = parse_note_date(name)
                 if d is None:
                     continue
@@ -107,13 +124,22 @@ class NoteStore:
                 # 같은 날짜 파일이 여러 개면 최근 수정된 것을 사용
                 if d not in found or st.st_mtime_ns > found[d][1]:
                     found[d] = (path, st.st_mtime_ns, st.st_size)
-        return found
+        return found, sched
 
     def refresh(self):
         """변경된 날짜 목록을 반환."""
         with self.lock:
             root = self.root
-        found = self._scan(root)
+        found, sched = self._scan(root)
+        events = None
+        if sched != self.sched_files:
+            events = []
+            for path in sorted(sched):
+                try:
+                    events += schedule.parse(read_text(path))
+                except OSError:
+                    pass
+            events.sort(key=schedule.sort_key)
         changed = []
         with self.lock:
             if root != self.root:  # 스캔 도중 경로가 바뀜
@@ -122,21 +148,43 @@ class NoteStore:
                 if self.files.get(d) != info:
                     changed.append(d)
                     try:
-                        self.summary[d] = count_tasks(read_text(info[0]))
+                        text = read_text(info[0])
+                        self.summary[d] = count_tasks(text)
+                        self.blank.discard(d) if text.strip() else self.blank.add(d)
                     except OSError:
                         self.summary[d] = (0, 0)
             for d in list(self.files):
                 if d not in found:
                     changed.append(d)
                     self.summary.pop(d, None)
+                    self.blank.discard(d)
             self.files = found
+            if events is not None:
+                self.sched_files = sched
+                self.events = events
+                self.sched_changed = True
         return changed
+
+    def pop_schedule_changed(self):
+        with self.lock:
+            changed, self.sched_changed = self.sched_changed, False
+            return changed
+
+    def schedule(self):
+        with self.lock:
+            return list(self.events)
+
+    def prev_note(self, d):
+        """d 이전에 있는 가장 최근 노트(빈 노트 제외) 날짜 (어제 노트 복사용)"""
+        with self.lock:
+            earlier = [x for x in self.files if x < d and x not in self.blank]
+        return max(earlier).isoformat() if earlier else None
 
     def note(self, d):
         with self.lock:
             info = self.files.get(d)
         if not info:
-            return {"date": d.isoformat(), "exists": False, "no_dir": not self.has_root()}
+            return {"date": d.isoformat(), "exists": False, "no_dir": not self.has_root(), "prev": self.prev_note(d)}
         path, mtime_ns, _ = info
         try:
             text = read_text(path)
@@ -151,6 +199,7 @@ class NoteStore:
             "content": text,
             "done": done,
             "total": total,
+            "prev": self.prev_note(d) if not text.strip() else None,
         }
 
     def write(self, d, content, base_mtime=None):
@@ -350,6 +399,8 @@ class Handler(BaseHTTPRequestHandler):
             elif url.path == "/api/note":
                 d = dt.date.fromisoformat(qs.get("date", [dt.date.today().isoformat()])[0])
                 self._send_json(share.store.note(d))
+            elif url.path == "/api/schedule":
+                self._send_json({"events": share.store.schedule()})
             elif url.path == "/api/month":
                 y, m = map(int, qs["ym"][0].split("-"))
                 self._send_json({"ym": f"{y:04d}-{m:02d}", "days": share.store.month(y, m)})
@@ -442,6 +493,8 @@ class ShareServer:
             changed = self.store.refresh()
             if changed:
                 self.hub.broadcast("changed", {"dates": sorted(d.isoformat() for d in changed)})
+            if self.store.pop_schedule_changed():
+                self.hub.broadcast("schedule", {})
             time.sleep(POLL_INTERVAL)
 
     def set_root(self, path):

@@ -18,7 +18,7 @@ from ctypes import wintypes
 import pystray
 from PIL import Image, ImageDraw
 from PySide6.QtCore import QBuffer, QByteArray, QFile, QIODevice, QObject, QPoint, QSize, Qt, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices, QGuiApplication
+from PySide6.QtGui import QColor, QCursor, QDesktopServices, QGuiApplication, QPalette, QRegion
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import (QWebEnginePage, QWebEngineProfile, QWebEngineScript,
                                       QWebEngineUrlRequestInterceptor, QWebEngineUrlRequestJob, QWebEngineUrlScheme,
@@ -373,7 +373,7 @@ class Bridge(QObject):
 
     @Slot()
     def startResize(self):
-        self.win.windowHandle().startSystemResize(Qt.Edge.RightEdge | Qt.Edge.BottomEdge)
+        self.win.start_resize()
 
     @Slot(int, int)
     def setNavSize(self, w, h):
@@ -499,6 +499,32 @@ PANEL_DEFAULT_SIZE = {"note": (440, 640), "cal": (400, 420)}
 PANEL_MIN_SIZE = {"note": (400, 300), "cal": (340, 300)}
 
 
+class ResizeGhost(QWidget):
+    """크기 조절 중에 보여주는 외곽선.
+    반투명 창 + 웹뷰는 크기가 바뀔 때마다 화면 전체를 다시 그려서 끌 때 버벅이므로,
+    끄는 동안은 이 선만 움직이고 마우스를 놓을 때 한 번만 실제 창 크기를 바꾼다."""
+
+    BORDER = 2
+
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool |
+                         Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowTransparentForInput)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        pal = self.palette()
+        pal.setColor(QPalette.ColorRole.Window, QColor("#2f80ed"))
+        self.setPalette(pal)
+        self.setAutoFillBackground(True)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        b = self.BORDER
+        r = self.rect()
+        self.setMask(QRegion(r).subtracted(QRegion(r.adjusted(b, b, -b, -b))))
+
+
+VK_LBUTTON = 0x01
+
+
 class Overlay(QWidget):
     """바탕화면 오버레이 창. 노트 하나(내 노트 또는 다른 사람)마다
     네비게이션 바(mode="nav") 하나와, 따로 열고 닫는 할일(note)·달력(cal) 창이 있다."""
@@ -618,6 +644,36 @@ class Overlay(QWidget):
         else:
             self.setMinimumSize(0, 0)
             self.resize(self.nav_size)
+
+    def start_resize(self):
+        """오른쪽 아래 손잡이로 크기 조절 시작 (외곽선만 따라다님)"""
+        if getattr(self, "_ghost", None) is None:
+            self._ghost = ResizeGhost()
+            self._resize_timer = QTimer(self, interval=15, timeout=self._resize_tick)
+        self._resize_from = (QCursor.pos(), self.size())
+        self._resize_size = self.size()
+        self._ghost.setGeometry(self.geometry().adjusted(*self._margins()))
+        self._ghost.show()
+        self._resize_timer.start()
+
+    def _margins(self):
+        m = 10  # 그림자용 투명 여백 (style.css #root padding) 안쪽 = 보이는 창
+        return m, m, -m, -m
+
+    def _resize_tick(self):
+        start, size = self._resize_from
+        d = QCursor.pos() - start
+        mn = self.minimumSize()
+        w = max(mn.width(), size.width() + d.x(), 120)
+        h = max(mn.height(), size.height() + d.y(), 80)
+        self._resize_size = QSize(w, h)
+        geo = self.geometry()
+        geo.setSize(self._resize_size)
+        self._ghost.setGeometry(geo.adjusted(*self._margins()))
+        if not ctypes.windll.user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000:
+            self._resize_timer.stop()
+            self._ghost.hide()
+            self.resize(self._resize_size)
 
     def keep_on_screen(self, anchor=None):
         anchor = anchor if anchor is not None else self.pos()

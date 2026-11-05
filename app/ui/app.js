@@ -8,26 +8,11 @@
   "use strict";
 
   const $ = (id) => document.getElementById(id);
-  const WD = ["일", "월", "화", "수", "목", "금", "토"];
   const DEFAULT_PORT = "8765";
   const MD = window.ObsidianMarkdown;
+  const CAL = window.DoganiCalendar;
+  const { WD, pad, iso, parseISO, addDays, addMonths } = CAL;
 
-  const pad = (n) => String(n).padStart(2, "0");
-  const iso = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-  const parseISO = (s) => {
-    const [y, m, d] = s.split("-").map(Number);
-    return new Date(y, m - 1, d);
-  };
-  const addDays = (s, n) => {
-    const d = parseISO(s);
-    d.setDate(d.getDate() + n);
-    return iso(d);
-  };
-  const addMonths = (ym, n) => {
-    const [y, m] = ym.split("-").map(Number);
-    const d = new Date(y, m - 1 + n, 1);
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
-  };
   const dayLabel = (s) => {
     const d = parseISO(s);
     return `${String(d.getFullYear()).slice(2)}${pad(d.getMonth() + 1)}${pad(d.getDate())} ${WD[d.getDay()]}`;
@@ -53,6 +38,7 @@
     units: [],
     active: null,      // 편집 중인 단위 { start, end, block, indent, list }
     editing: false,
+    sched: null,       // 일정 색인 (CAL.index) — 달력 표시, 쉬는 날 건너뛰기
   };
   let bridge = null;
 
@@ -124,6 +110,7 @@
     };
     es.addEventListener("hello", (e) => {
       applyPaused(e);
+      loadSchedule();
       api("/api/info").then((info) => {
         setWritable(!!info.writable);
         if (!state.mine && info.name) {
@@ -133,6 +120,7 @@
       }).catch(() => {});
     });
     es.addEventListener("status", applyPaused);
+    es.addEventListener("schedule", () => loadSchedule());
     es.addEventListener("changed", (e) => {
       const dates = JSON.parse(e.data).dates || [];
       pulse();
@@ -140,7 +128,7 @@
       if (state.view === "note" && !state.editing && dates.includes(state.noteDate)) loadNote(true);
       if (state.view === "cal" && dates.some((d) => d.startsWith(state.calYM))) loadMonth();
     });
-    es.addEventListener("reload", () => refresh());
+    es.addEventListener("reload", () => { loadSchedule(); refresh(); });
     es.onerror = () => {
       if (state.es !== es) return;
       // 브라우저가 자동 재연결을 포기한 경우(CLOSED: 403 등)에는 이유를 확인하고 직접 재시도
@@ -161,7 +149,44 @@
     else if (state.view === "cal") loadMonth();
   }
 
+  async function loadSchedule() {
+    try {
+      state.sched = CAL.index((await api("/api/schedule")).events);
+    } catch (e) {
+      return; // 예전 버전 Dogani(일정 API 없음) 이거나 연결 끊김: 기존 것 유지
+    }
+    if (state.view === "cal") loadMonth();
+    if (state.view === "note") renderSchedRow();
+  }
+
   // ------------------------------------------------------------ note view
+  function renderSchedRow() {
+    const row = $("note-sched");
+    const html = CAL.dayEvents(state.noteDate, state.sched);
+    row.innerHTML = html;
+    row.hidden = !html;
+  }
+
+  /** 노트가 없거나 비었을 때: 직전 노트를 그대로 복사하는 버튼 */
+  function copyButton(note) {
+    if (!state.writable || !note || !note.prev || note.no_dir) return "";
+    return `<button class="copy-prev" data-prev="${note.prev}">어제 노트 복사 <span>(${dayLabel(note.prev)})</span></button>`;
+  }
+
+  async function copyPrev(prev) {
+    const date = state.noteDate;
+    const target = state.note;
+    try {
+      const src = await api(`/api/note?date=${prev}`);
+      if (!src.exists) throw Object.assign(new Error(), { code: "write_failed" });
+      await api("/api/note", { date, content: src.content, base_mtime: target && target.exists ? target.mtime : null });
+    } catch (e) {
+      $("note-footer").textContent = errorText(e);
+      return;
+    }
+    if (state.noteDate === date) loadNote(false);
+  }
+
   function showMessage(html) {
     state.lines = null;
     $("note-body").innerHTML = `<div class="empty">${html}</div>`;
@@ -174,6 +199,7 @@
     const body = $("note-body");
     $("note-title").textContent = dayLabel(date);
     $("note-title").classList.toggle("is-today", date === state.today);
+    renderSchedRow();
     let note;
     try {
       note = await api(`/api/note?date=${date}`);
@@ -192,7 +218,7 @@
           ? "todo 폴더가 지정되지 않았습니다.<br>트레이 &gt; todo 경로 &gt; 찾아보기..."
           : "상대방이 todo 폴더를 지정하지 않았습니다.");
       } else {
-        showMessage(state.writable ? "이 날짜의 노트가 없습니다.<br>클릭해서 작성" : "이 날짜의 노트가 없습니다.");
+        showMessage(state.writable ? `이 날짜의 노트가 없습니다.<br>클릭해서 작성${copyButton(note)}` : "이 날짜의 노트가 없습니다.");
       }
       return;
     }
@@ -200,6 +226,9 @@
     state.eol = note.content.includes("\r\n") ? "\r\n" : "\n";
     state.lines = note.content.split(/\r\n|\n/);
     renderNote(keepScroll ? body.scrollTop : 0);
+    if (!note.content.trim() && copyButton(note)) {
+      body.insertAdjacentHTML("beforeend", `<div class="empty">${copyButton(note)}</div>`);
+    }
     setProgress(note.done, note.total);
     const t = new Date(note.mtime);
     $("note-footer").textContent =
@@ -214,19 +243,23 @@
     const frag = document.createDocumentFragment();
     let editor = null;
     for (const u of state.units) {
+      // 여러 줄 편집 범위 안의 나머지 단위는 첫 단위의 textarea 에 들어가 있으므로 건너뜀
+      if (state.active && u.start > state.active.start && u.start <= state.active.end) continue;
       const div = document.createElement("div");
       div.dataset.start = u.start;
-      if (u.style) div.setAttribute("style", u.style);
-      if (u.callout) div.dataset.callout = u.callout;
+      const multi = state.active && state.active.multi && state.active.start === u.start;
+      // 여러 줄 편집 칸은 첫 줄 서식(헤더 글씨 크기·들여쓰기·콜아웃)을 물려받지 않고 일반 원문 블록으로
+      if (u.style && !multi) div.setAttribute("style", u.style);
+      if (u.callout && !multi) div.dataset.callout = u.callout;
       if (state.active && state.active.start === u.start) {
-        div.className = u.rawCls + " lp-active";
-        if (u.guides) div.innerHTML = u.guides;
+        div.className = (multi ? "lp-raw-block" : u.rawCls) + " lp-active";
+        if (u.guides && !state.active.multi) div.innerHTML = u.guides;
         editor = document.createElement("textarea");
         editor.className = "lp-editor";
         editor.rows = 1;
         editor.spellcheck = false;
         editor.value = state.active.block
-          ? state.lines.slice(u.start, u.end + 1).join("\n")
+          ? state.lines.slice(u.start, state.active.end + 1).join("\n")
           : state.lines[u.start].slice(state.active.indent.length);
         div.append(editor);
         bindEditor(editor);
@@ -314,26 +347,66 @@
   const unitAt = (line) => state.units.find((u) => u.start <= line && line <= u.end) || state.units[state.units.length - 1];
 
   /** line 줄의 col 위치(원문 기준)에 커서를 두고 그 줄(단위)을 원문 편집 상태로 */
-  function activate(line, col) {
+  function activate(line, col, line2, col2) {
     if (!state.writable || !state.lines) return;
     state.units = MD.units(state.lines);
-    line = Math.max(0, Math.min(line, state.lines.length - 1));
-    const u = unitAt(line);
-    state.active = { start: u.start, end: u.end, block: !!u.block, indent: u.indent || "", list: !!u.list };
+    const clamp = (l) => Math.max(0, Math.min(l, state.lines.length - 1));
+    line = clamp(line);
+    if (line2 === undefined) { line2 = line; col2 = col; }
+    line2 = clamp(line2);
+    let u = unitAt(line), u2 = unitAt(line2);
+    if (u2.start < u.start) [u, u2] = [u2, u];
+    if (u !== u2) {
+      // 여러 단위에 걸친 선택 → 그 범위 전체를 원문 여러 줄 편집으로
+      state.active = { start: u.start, end: u2.end, block: true, multi: true, indent: "", list: false };
+    } else {
+      state.active = { start: u.start, end: u.end, block: !!u.block, indent: u.indent || "", list: !!u.list };
+    }
     state.editing = true;
     $("note-body").classList.add("editing");
     const ed = renderNote();
-    let pos;
-    if (u.block) {
-      pos = 0;
-      for (let k = u.start; k < line; k++) pos += state.lines[k].length + 1;
-      pos += Math.min(col, state.lines[line].length);
-    } else {
-      pos = Math.max(0, Math.min(col - state.active.indent.length, ed.value.length));
-    }
+    const a = state.active;
+    const posOf = (l, c) => {
+      if (a.block) {
+        let p = 0;
+        for (let k = a.start; k < l; k++) p += state.lines[k].length + 1;
+        return p + Math.max(0, Math.min(c, state.lines[l].length));
+      }
+      return Math.max(0, Math.min(c - a.indent.length, ed.value.length));
+    };
+    const p1 = posOf(line, col), p2 = posOf(line2, col2);
     ed.focus({ preventScroll: true });
-    ed.setSelectionRange(pos, pos);
+    ed.setSelectionRange(Math.min(p1, p2), Math.max(p1, p2), p2 < p1 ? "backward" : "forward");
     ed.scrollIntoView({ block: "nearest" });
+  }
+
+  /** textarea 안 위치 → 원문 {line, col} */
+  function editorPos(ed, p) {
+    const a = state.active;
+    if (!a.block) return { line: a.start, col: a.indent.length + p };
+    const before = ed.value.slice(0, p).split("\n");
+    return { line: a.start + before.length - 1, col: before[before.length - 1].length };
+  }
+
+  /** DOM 선택 지점(node, offset) → 원문 {line, col}. 못 찾으면 null */
+  function domPos(node, offset, isEnd) {
+    let elNode = node.nodeType === 1 ? node : node.parentElement;
+    if (elNode && elNode.id === "note-body") {
+      const kids = elNode.children;
+      if (!kids.length) return null;
+      elNode = kids[Math.min(offset, kids.length - 1)];
+      if (offset >= kids.length) isEnd = true;
+    }
+    const el = elNode && elNode.closest("[data-start]");
+    if (!el) return null;
+    const u = state.units.find((x) => x.start === +el.dataset.start);
+    if (!u) return null;
+    const ed = el.querySelector(".lp-editor");
+    if (ed) return editorPos(ed, isEnd ? ed.selectionEnd : ed.selectionStart);
+    if (u.block || !el.querySelector(".lp-text")) {
+      return isEnd ? { line: u.end, col: state.lines[u.end].length } : { line: u.start, col: 0 };
+    }
+    return { line: u.start, col: textCol(el, u, node, offset) };
   }
 
   function exitEdit() {
@@ -392,6 +465,17 @@
       }
       autosize(ed);
       changed();
+    });
+
+    // 여러 줄 편집 중 선택을 풀면(클릭·방향키) 커서 있는 줄만 남기고 나머지는 다시 렌더링
+    const collapseMulti = () => {
+      if (!a.multi || state.active !== a || ed.selectionStart !== ed.selectionEnd) return;
+      const p = editorPos(ed, ed.selectionStart);
+      activate(p.line, p.col);
+    };
+    ed.addEventListener("mouseup", () => setTimeout(collapseMulti));
+    ed.addEventListener("keyup", (e) => {
+      if (/^(Arrow|Home|End|Page)/.test(e.key) && !e.shiftKey) collapseMulti();
     });
 
     ed.addEventListener("keydown", (e) => {
@@ -521,22 +605,31 @@
 
   /** 클릭 위치 → 렌더링된 글자 기준 오프셋 → 원문 열 위치 (기호는 건너뛰며 글자 맞추기) */
   function clickToCol(e, el, u) {
+    const textEl = el.querySelector(".lp-text");
+    if (!textEl) return state.lines[u.start].length;
+    const r = document.caretRangeFromPoint(e.clientX, e.clientY);
+    if (r && textEl.contains(r.startContainer)) return textCol(el, u, r.startContainer, r.startOffset);
+    const rect = textEl.getBoundingClientRect();
+    return textCol(el, u, null, e.clientX < rect.left && e.clientY < rect.bottom ? 0 : Infinity);
+  }
+
+  /** 렌더링된 글자 위치(node, offset) → 원문 열. node 가 null 이면 offset 은 렌더링 글자 수 */
+  function textCol(el, u, node, offset) {
     const raw = state.lines[u.start];
     const textEl = el.querySelector(".lp-text");
-    if (!textEl) return raw.length;
-    let offset = null;
-    const r = document.caretRangeFromPoint(e.clientX, e.clientY);
-    if (r && textEl.contains(r.startContainer)) {
-      const pre = document.createRange();
-      pre.setStart(textEl, 0);
-      pre.setEnd(r.startContainer, r.startOffset);
-      offset = pre.toString().length;
-    }
     const rendered = textEl.textContent;
-    if (offset === null) {
-      const rect = textEl.getBoundingClientRect();
-      offset = e.clientX < rect.left && e.clientY < rect.bottom ? 0 : rendered.length;
+    if (node) {
+      if (!textEl.contains(node)) {
+        // 기호 영역 등 글자 밖: 글자 앞이면 0, 뒤면 끝
+        offset = textEl.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_PRECEDING ? 0 : rendered.length;
+      } else {
+        const pre = document.createRange();
+        pre.setStart(textEl, 0);
+        pre.setEnd(node, offset);
+        offset = pre.toString().length;
+      }
     }
+    offset = Math.min(offset, rendered.length);
     const src = raw.slice(u.textStart || 0);
     let i = 0, j = 0;
     while (j < offset && i < src.length) {
@@ -560,34 +653,10 @@
     }
     if (ym !== state.calYM) return;
 
-    const grid = $("cal-grid");
-    let html = WD.map((w, k) => `<div class="wd${k === 0 ? " sun" : k === 6 ? " sat" : ""}">${w}</div>`).join("");
-    const first = new Date(y, m - 1, 1);
-    const cursor = new Date(y, m - 1, 1 - first.getDay());
-    let notes = 0, sumDone = 0, sumTotal = 0;
-
-    for (let k = 0; k < 42; k++) {
-      const d = iso(cursor);
-      const info = days[d];
-      const cls = ["cal-day"];
-      if (cursor.getMonth() !== m - 1) cls.push("other");
-      if (cursor.getDay() === 0) cls.push("sun");
-      if (cursor.getDay() === 6) cls.push("sat");
-      if (d === state.today) cls.push("today");
-      if (d === state.noteDate) cls.push("selected");
-      let count = "";
-      if (info) {
-        notes++;
-        sumDone += info.done;
-        sumTotal += info.total;
-        const c = info.total === 0 ? "none" : info.done === info.total ? "done" : "";
-        count = `<span class="count ${c}">${info.done}/${info.total}</span>`;
-      }
-      html += `<div class="${cls.join(" ")}" data-date="${d}"><span class="num">${cursor.getDate()}</span>${count}</div>`;
-      cursor.setDate(cursor.getDate() + 1);
-    }
-    grid.innerHTML = html;
-    $("cal-footer").textContent = failed ? failed : `노트 ${notes}개 · 완료 ${sumDone}/${sumTotal}`;
+    const r = CAL.renderMonth({ ym, days, idx: state.sched, today: state.today, selected: state.noteDate });
+    $("cal-grid").innerHTML = r.html;
+    CAL.fitCells($("cal-grid"));
+    $("cal-footer").textContent = failed ? failed : `노트 ${r.notes}개 · 완료 ${r.done}/${r.total}`;
   }
 
   // ------------------------------------------------------------ view / window
@@ -660,21 +729,53 @@
     // 닫기 전에 저장이 끝나도록
     saveChain.then(() => { if (bridge) bridge.closePanel(); });
   });
-  $("note-prev").addEventListener("click", () => showNote(addDays(state.noteDate, -1)));
-  $("note-next").addEventListener("click", () => showNote(addDays(state.noteDate, 1)));
+  // 화살표는 토/일·쉬는 날을 건너뜀 (그 날 노트는 달력에서 눌러서 열기)
+  $("note-prev").addEventListener("click", () => showNote(CAL.nextWorkday(state.noteDate, -1, state.sched)));
+  $("note-next").addEventListener("click", () => showNote(CAL.nextWorkday(state.noteDate, 1, state.sched)));
   $("note-today").addEventListener("click", () => showNote(state.today));
 
   $("note-body").addEventListener("mousedown", (e) => {
     // 체크박스를 눌러도 편집 중인 줄의 포커스가 빠지지 않게
     if (state.writable && e.target.closest(".task-checkbox")) e.preventDefault();
+    downInEditor = !!e.target.closest(".lp-editor");
   });
+  let downInEditor = false;
   $("note-body").addEventListener("click", (e) => {
-    if (!state.writable || state.status !== "online" || e.target.closest(".lp-editor")) return;
-    const box = e.target.closest(".task-checkbox");
+    if (!state.writable || state.status !== "online") return;
+    const fromEditor = downInEditor;
+    downInEditor = false;
     const el = e.target.closest("[data-start]");
+
+    // 편집 중인 textarea 에서 끌어서 다른 줄까지 선택 → 그 범위를 여러 줄 편집으로
+    if (fromEditor || e.target.closest(".lp-editor")) {
+      const ed = document.querySelector(".lp-editor");
+      if (!ed || !state.active || e.target.closest(".lp-editor")) return;
+      const anchor = editorPos(ed, ed.selectionDirection === "backward" ? ed.selectionEnd : ed.selectionStart);
+      const r = document.caretRangeFromPoint(e.clientX, e.clientY);
+      const focus = (r && domPos(r.startContainer, r.startOffset, true)) ||
+        (el ? null : { line: state.lines.length - 1, col: state.lines[state.lines.length - 1].length });
+      if (focus) activate(anchor.line, anchor.col, focus.line, focus.col);
+      return;
+    }
+
+    const copy = e.target.closest(".copy-prev");
+    if (copy) return copyPrev(copy.dataset.prev);
+    const box = e.target.closest(".task-checkbox");
     if (box && el) return toggleTask(+el.dataset.start);
     if (e.target.closest("a")) return;
-    if (!state.editing && String(window.getSelection())) return; // 글자 선택(복사)은 편집 안 함
+
+    // 끌어서 글자 선택 → 선택한 범위 그대로 편집 (여러 줄이면 여러 줄 편집)
+    const sel = window.getSelection();
+    if (state.lines && sel.rangeCount && !sel.isCollapsed) {
+      const r = sel.getRangeAt(0);
+      const p = domPos(r.startContainer, r.startOffset, false);
+      const q = domPos(r.endContainer, r.endOffset, true);
+      if (p && q) {
+        const back = sel.anchorNode === r.endContainer && sel.anchorOffset === r.endOffset && !(p.line === q.line && p.col === q.col);
+        return back ? activate(q.line, q.col, p.line, p.col) : activate(p.line, p.col, q.line, q.col);
+      }
+      return;
+    }
 
     if (!state.lines) {
       // 노트가 없는 날짜: 빈 노트로 작성 시작 (첫 저장 때 파일 생성)
@@ -734,6 +835,11 @@
   });
   document.addEventListener("contextmenu", (e) => e.preventDefault());
   setInterval(checkDateRollover, 30 * 1000);
+  let fitTimer = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(fitTimer);
+    fitTimer = setTimeout(() => { if (state.view === "cal") CAL.fitCells($("cal-grid")); }, 100);
+  });
 
   // ------------------------------------------------------------ init
   window.App = {
