@@ -11,6 +11,8 @@
 - 시간: 날짜 뒤에 "15:00" 또는 "9:00-12:00" (없어도 됨)
 - 날짜를 **굵게** = 중요 표시, ==하이라이트== = 쉬는 날 (노트 화살표 이동에서 건너뜀),
   *기울임* = 기간을 화살표(←──→)로 표시
+- "10:00-10:30?" 처럼 시간 끝에 ? = 그 사이 언젠가 (정확한 시각 모름)
+- "-261119" = 시작 미정, 마감만 / "261119-" = 시작만, 끝 미정 (달력에서 페이드로 표시)
 - 태그는 #으로 시작하는 칸(여러 개 가능), 태그가 아닌 칸은 순서대로 장소, 메모
 """
 import datetime as dt
@@ -20,7 +22,9 @@ SCHEDULE_FILE_RE = re.compile(r"^(?:\d{4}\s*)?일정\.md$", re.I)
 
 _DATE = r"(\d{6}|\d{4}-\d{2}-\d{2})"
 _FIRST_RE = re.compile(_DATE + r"(?:\s*[-~]\s*(\d{4}-\d{2}-\d{2}|\d{6}|\d{4}|\d{2})(?!\d))?\s*(.*)$")
-_TIME_RE = re.compile(r"^\d{1,2}:\d{2}(?:\s*[-~]\s*\d{1,2}:\d{2})?$")
+_TIME_RE = re.compile(r"^\d{1,2}:\d{2}(?:\s*[-~]\s*\d{1,2}:\d{2})?\??$")
+_OPEN_START_RE = re.compile(r"^[-~]\s*" + _DATE + r"(?!\d)\s*(.*)$")       # -261119 : 시작 미정, 마감만
+_OPEN_END_RE = re.compile(r"^" + _DATE + r"\s*[-~](?=\s*$|\s+\d{1,2}:|\s*[^\d\s])\s*(.*)$")       # 261119- : 시작만, 끝 미정
 _LIST_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?:\[.\]\s+)?")
 _MARK_RE = re.compile(r"\*|==")  # 굵게(**)·기울임(*)·하이라이트(==) 기호
 
@@ -62,17 +66,27 @@ def parse_line(line):
     holiday = "==" in head
     important = "**" in head
     italic = bool(re.search(r"(?<!\*)\*(?!\*)", head.replace("***", "*")))  # *기울임* (***굵게+기울임*** 포함)
-    m = _FIRST_RE.match(_MARK_RE.sub("", head).strip())
-    if not m:
-        return None
+    plain = _MARK_RE.sub("", head).strip()
+    open_ = ""
     try:
-        start = _date(m[1])
-        end = _end_date(m[2], start) if m[2] else start
+        if m := _OPEN_START_RE.match(plain):
+            # 달력엔 마감 전날부터 그려서 앞쪽이 페이드로 들어오게
+            open_, end = "start", _date(m[1])
+            start, time = end - dt.timedelta(days=1), m[2]
+        elif m := _OPEN_END_RE.match(plain):
+            open_, start = "end", _date(m[1])
+            end, time = start + dt.timedelta(days=1), m[2]
+        elif m := _FIRST_RE.match(plain):
+            start = _date(m[1])
+            end = _end_date(m[2], start) if m[2] else start
+            time = m[3]
+        else:
+            return None
     except ValueError:
         return None
     if end < start:
         start, end = end, start
-    time = m[3].strip()
+    time = time.strip()
     if time and not _TIME_RE.match(time):
         # 날짜 뒤가 시간이 아니면 제목으로 본다 ("261119 과제 실사, ...")
         fields.insert(1, time)
@@ -88,7 +102,9 @@ def parse_line(line):
     return {
         "start": start.isoformat(),
         "end": end.isoformat(),
-        "time": re.sub(r"\s*[-~]\s*", "-", time),
+        "time": re.sub(r"\s*[-~]\s*", "-", time).rstrip("?"),
+        "uncertain": time.endswith("?"),  # 10:00-10:30? = 그 사이 언젠가
+        "open": open_,  # "start" = 시작 미정(-261119), "end" = 끝 미정(261119-)
         "title": title,
         "tags": tags,
         "place": others[0] if others else "",

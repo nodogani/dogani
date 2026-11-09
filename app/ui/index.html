@@ -5,51 +5,69 @@
   <title>Dogani Overlay</title>
   <link rel="stylesheet" href="style.css">
 </head>
-<body class="theme-light">
+<body class="theme-light mode-nav">
   <div id="root">
+    <!-- 네비게이션 바 (하나뿐): 공간 이름 ▾ · 할일 날짜 이동 · 할일/달력 버튼 -->
     <nav id="nav" title="드래그해서 이동">
-      <span id="status-dot" class="dot"></span>
-      <span id="server-label"></span>
-      <!-- 펼쳤을 때 네비게이션 바 안에 날짜 이동 표시 -->
-      <div class="nav-date" id="note-header" hidden>
-        <button class="icon-btn" id="note-prev" title="이전 날">&#x2039;</button>
-        <div class="header-title" id="note-title"></div>
-        <button class="icon-btn" id="note-next" title="다음 날">&#x203A;</button>
-        <button class="text-btn" id="note-today">오늘</button>
-      </div>
-      <div class="nav-date" id="cal-header" hidden>
-        <button class="icon-btn" id="cal-prev" title="이전 달">&#x2039;</button>
-        <div class="header-title" id="cal-title"></div>
-        <button class="icon-btn" id="cal-next" title="다음 달">&#x203A;</button>
-        <button class="text-btn" id="cal-today">오늘</button>
-      </div>
-      <button id="btn-note" class="nav-btn" title="오늘의 노트">
+      <button id="space-btn" class="space-btn" title="공간 고르기 (공용 / 개인)">
+        <span id="status-dot" class="dot"></span>
+        <span id="space-name"></span>
+        <svg class="caret" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <button id="btn-note" class="nav-btn" title="할일">
         <svg viewBox="0 0 24 24"><path d="M9 11l3 3 8-8"/><path d="M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"/></svg>
       </button>
       <button id="btn-cal" class="nav-btn" title="달력">
         <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 10h18"/></svg>
       </button>
-      <button id="btn-close" class="nav-btn" title="닫기">
-        <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
-      </button>
     </nav>
 
+    <!-- 공간 메뉴 (노션 사이드바처럼 공용 / 개인) -->
+    <div id="space-menu" class="space-menu" hidden></div>
+
     <section id="panel" hidden>
-      <!-- 노트 보기 -->
+      <!-- 할일 창 -->
       <div id="view-note" class="view" hidden>
-        <div class="sched-row" id="note-sched" hidden></div>
-        <div class="progress-row" id="note-progress" hidden>
+        <div class="panel-bar" title="드래그해서 이동">
+          <button class="icon-btn" id="note-prev" title="이전 근무일">&#x2039;</button>
+          <div class="header-title" id="note-title"></div>
+          <button class="icon-btn" id="note-next" title="다음 근무일">&#x203A;</button>
+          <button class="text-btn" id="note-today">오늘</button>
+          <button class="icon-btn close-btn" title="닫기">&#x2715;</button>
+        </div>
+        <div class="progress-row" id="note-progress">
           <div class="progress"><div class="progress-bar" id="note-bar"></div></div>
           <span class="progress-text" id="note-count"></span>
         </div>
+        <div class="sched-row" id="note-sched" hidden></div>
         <article id="note-body" class="markdown-rendered"></article>
         <footer class="view-footer" id="note-footer"></footer>
       </div>
 
-      <!-- 달력 보기 -->
+      <!-- 달력 창 -->
       <div id="view-cal" class="view" hidden>
+        <div class="panel-bar" title="드래그해서 이동">
+          <button class="icon-btn" id="cal-prev" title="이전 달">&#x2039;</button>
+          <div class="header-title" id="cal-title"></div>
+          <button class="icon-btn" id="cal-next" title="다음 달">&#x203A;</button>
+          <button class="text-btn" id="cal-today">오늘</button>
+          <button class="text-btn" id="cal-edit" title="일정 파일 편집">일정 편집</button>
+          <button class="icon-btn close-btn" title="닫기">&#x2715;</button>
+        </div>
         <div id="cal-grid" class="cal-grid"></div>
         <footer class="view-footer" id="cal-footer"></footer>
+      </div>
+
+      <!-- 달력 창 > 일정 편집 -->
+      <div id="view-doc" class="view" hidden>
+        <div class="panel-bar" title="드래그해서 이동">
+          <button class="text-btn" id="doc-back">&#x2039; 달력</button>
+          <div class="header-title" id="doc-title">일정</div>
+          <button class="icon-btn close-btn" title="닫기">&#x2715;</button>
+        </div>
+        <div class="doc-hint">한 줄 = <code>날짜, 제목, #태그, 장소, 메모</code> · <b>**굵게**</b> 중요 · <mark>==하이라이트==</mark> 쉬는 날 · <i>*기울임*</i> 기간 화살표</div>
+        <article id="doc-body" class="markdown-rendered"></article>
+        <footer class="view-footer" id="doc-footer"></footer>
       </div>
 
       <div id="resize-grip" title="크기 조절"></div>

@@ -14,9 +14,11 @@ import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import schedule
+
+from team import NAME_MAX, TeamAuth, TeamError
 
 POLL_INTERVAL = 1.0      # 파일 변경 감시 주기(초)
 HEARTBEAT_INTERVAL = 15  # SSE keep-alive 주기(초)
@@ -29,6 +31,8 @@ FILE_PATTERNS = [
 # Dogani 프로그램 식별용 헤더 (보안 인증이 아니라 "브라우저로 그냥 열람"을 막는 용도)
 KEY_HEADER = "X-Dogani-Key"
 HOST_HEADER = "X-Dogani-Host"
+TOKEN_HEADER = "X-Dogani-Token"   # 팀원 토큰 (team.py)
+USER_HEADER = "X-Dogani-User"     # 표시 이름 (URL 인코딩)
 CLIENT_KEY = "dogani-client-v1"
 TASK_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+\[(.)\]")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
@@ -225,6 +229,41 @@ class NoteStore:
         self.refresh()
         return self.note(d)
 
+    def sched_doc_path(self):
+        """편집할 일정 파일: 있으면 첫 번째(올해 것 우선), 없으면 선택폴더/일정.md"""
+        with self.lock:
+            paths = sorted(self.sched_files)
+            root = self.root
+        year = f"{dt.date.today().year}"
+        for p in paths:
+            if os.path.basename(p).startswith(year):
+                return p
+        if paths:
+            return paths[0]
+        return os.path.join(root, "일정.md") if root and os.path.isdir(root) else ""
+
+    def sched_doc(self):
+        path = self.sched_doc_path()
+        if not path:
+            return {"exists": False, "no_dir": True}
+        if not os.path.exists(path):
+            return {"exists": False, "title": os.path.splitext(os.path.basename(path))[0]}
+        st = os.stat(path)
+        return {"exists": True, "title": os.path.splitext(os.path.basename(path))[0],
+                "mtime": st.st_mtime_ns // 1_000_000, "content": read_text(path)}
+
+    def write_sched_doc(self, content, base_mtime=None):
+        path = self.sched_doc_path()
+        if not path:
+            raise OSError("todo 경로가 지정되지 않았습니다")
+        if os.path.exists(path) and base_mtime is not None and os.stat(path).st_mtime_ns // 1_000_000 != base_mtime:
+            return None
+        tmp = path + ".dogani.tmp"
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+        os.replace(tmp, path)
+        return self.sched_doc()
+
     def month(self, year, month):
         with self.lock:
             return {
@@ -241,13 +280,13 @@ class Hub:
     def __init__(self, blocked=()):
         self.lock = threading.Lock()
         self.subscribers = []  # (ip, queue)
-        self.clients = {}      # ip -> {"active": int, "last_seen": float, "host": str}  (나 자신은 기록 안 함)
+        self.clients = {}      # ip -> {"active", "last_seen", "host", "user"}  (나 자신은 기록 안 함)
         self.blocked = set(blocked)
 
     def _client(self, ip):
-        return self.clients.setdefault(ip, {"active": 0, "last_seen": 0, "host": ""})
+        return self.clients.setdefault(ip, {"active": 0, "last_seen": 0, "host": "", "user": ""})
 
-    def subscribe(self, ip, host="", record=True):
+    def subscribe(self, ip, host="", record=True, user=""):
         q = queue.Queue()
         with self.lock:
             self.subscribers.append((ip, q))
@@ -257,6 +296,8 @@ class Hub:
                 c["last_seen"] = time.time()
                 if host:
                     c["host"] = host
+                if user:
+                    c["user"] = user
         return q
 
     def unsubscribe(self, ip, q):
@@ -267,12 +308,14 @@ class Hub:
                 c["active"] = max(0, c["active"] - 1)
                 c["last_seen"] = time.time()
 
-    def touch(self, ip, host=""):
+    def touch(self, ip, host="", user=""):
         with self.lock:
             c = self._client(ip)
             c["last_seen"] = time.time()
             if host:
                 c["host"] = host
+            if user:
+                c["user"] = user
 
     def is_blocked(self, ip):
         with self.lock:
@@ -303,6 +346,17 @@ class Hub:
             return {ip: dict(c) for ip, c in self.clients.items()}, set(self.blocked)
 
 
+class Ctx:
+    """요청 하나의 접속자 정보"""
+
+    def __init__(self, ip, host, owner, user, member):
+        self.ip = ip
+        self.host = host        # 상대 PC 이름
+        self.owner = owner      # 같은 PC (= 나)
+        self.user = user        # 상대가 보낸 표시 이름
+        self.member = member    # 토큰으로 확인된 팀원 (id, 이름) 또는 None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "Dogani/1.0"
     share: "ShareServer" = None
@@ -324,101 +378,175 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", f"{KEY_HEADER}, {HOST_HEADER}, Content-Type")
+        self.send_header("Access-Control-Allow-Headers",
+                         f"{KEY_HEADER}, {HOST_HEADER}, {TOKEN_HEADER}, {USER_HEADER}, Content-Type")
         self.end_headers()
 
     def _check(self):
-        """공통 접속 검사. 통과하면 (ip, host, owner), 아니면 응답을 보내고 None."""
+        """공통 접속 검사. 통과하면 Ctx, 아니면 응답을 보내고 None."""
         ip = self.client_address[0]
         # Dogani 프로그램만 접속 허용 (웹브라우저로 주소만 쳐서 보는 것을 막음)
         if self.headers.get(KEY_HEADER) != CLIENT_KEY:
             self._send_json({"error": "client_only", "message": "Dogani 로만 볼 수 있습니다."}, 403)
             return None
-        owner = self.share.is_owner(ip)
-        if not owner and self.share.hub.is_blocked(ip):
+        share = self.share
+        owner = share.is_owner(ip)
+        host = self.headers.get(HOST_HEADER, "")[:64]
+        user = unquote(self.headers.get(USER_HEADER, ""))[:NAME_MAX]
+        token = self.headers.get(TOKEN_HEADER, "")
+        member = None
+        if token:
+            if share.team:   # 내가 팀 호스트면 직접 확인 (내보낸 사람·PIN 초기화도 바로 반영)
+                mid = share.team.member(token)
+                if mid:
+                    member = (mid, next((m["name"] for m in share.team.members() if m["id"] == mid), user))
+            else:
+                member = share.auth.verify(token)
+            if member and not member[1]:
+                member = (member[0], user)
+        if not owner and share.hub.is_blocked(ip):
             self._send_json({"error": "blocked"}, 403)
             return None
-        host = self.headers.get(HOST_HEADER, "")[:64]
-        if not owner:
-            self.share.hub.touch(ip, host)
-        return ip, host, owner
+        return Ctx(ip, host, owner, user, member)
+
+    def _body(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length > MAX_NOTE_BYTES:
+            raise OverflowError
+        return json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+
+    # ------------------------------------------------------------ routing
+    def do_GET(self):
+        self._route("GET")
 
     def do_POST(self):
-        checked = self._check()
-        if not checked:
-            return
-        _, _, owner = checked
-        url = urlparse(self.path)
-        if url.path != "/api/note":
-            self._send_json({"error": "not found"}, 404)
-            return
-        if not owner:
-            self._send_json({"error": "read_only"}, 403)
-            return
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            if length > MAX_NOTE_BYTES:
-                self._send_json({"error": "too_large"}, 413)
-                return
-            body = json.loads(self.rfile.read(length).decode("utf-8"))
-            d = dt.date.fromisoformat(body["date"])
-            content = body["content"]
-            if not isinstance(content, str):
-                raise ValueError
-        except (KeyError, ValueError, TypeError):
-            self._send_json({"error": "bad request"}, 400)
-            return
-        share = self.share
-        try:
-            note = share.store.write(d, content, body.get("base_mtime"))
-        except OSError as e:
-            self._send_json({"error": "write_failed", "message": str(e)}, 500)
-            return
-        if note is None:
-            self._send_json({"error": "conflict"}, 409)
-            return
-        share.hub.broadcast("changed", {"dates": [d.isoformat()]})
-        self._send_json(note)
+        self._route("POST")
 
-    def do_GET(self):
-        checked = self._check()
-        if not checked:
+    def _route(self, method):
+        ctx = self._check()
+        if not ctx:
             return
-        ip, host, owner = checked
-        share = self.share
         url = urlparse(self.path)
         qs = parse_qs(url.query)
         try:
-            if url.path == "/api/info":
-                self._send_json({"app": "Dogani", "name": share.name, "today": dt.date.today().isoformat(),
-                                 "paused": share.paused and not owner, "writable": owner})
-            elif url.path == "/api/events":
-                self._stream(ip, host, owner)
-            elif share.paused and not owner:
-                self._send_json({"error": "paused"}, 503)
-            elif url.path == "/api/note":
-                d = dt.date.fromisoformat(qs.get("date", [dt.date.today().isoformat()])[0])
-                self._send_json(share.store.note(d))
-            elif url.path == "/api/schedule":
-                self._send_json({"events": share.store.schedule()})
-            elif url.path == "/api/month":
-                y, m = map(int, qs["ym"][0].split("-"))
-                self._send_json({"ym": f"{y:04d}-{m:02d}", "days": share.store.month(y, m)})
+            if url.path.startswith("/api/team/"):
+                self._team(method, url.path[len("/api/team"):], qs, ctx)
+            elif url.path.startswith("/api/"):
+                self._personal(method, url.path[len("/api"):], qs, ctx)
             else:
                 self._send_json({"error": "not found"}, 404)
-        except (KeyError, ValueError):
+        except TeamError as e:
+            self._send_json({"error": e.code, "message": e.message}, e.status)
+        except OverflowError:
+            self._send_json({"error": "too_large"}, 413)
+        except (KeyError, ValueError, TypeError, AttributeError):
             self._send_json({"error": "bad request"}, 400)
 
-    def _stream(self, ip, host, owner):
+    # ------------------------------------------------------------ 개인 공간 (내 노트)
+    def _personal(self, method, path, qs, ctx):
+        share = self.share
+        if not ctx.owner:
+            share.hub.touch(ctx.ip, ctx.host, ctx.member[1] if ctx.member else "")
+        if path == "/info":
+            return self._send_json({"app": "Dogani", "name": share.name, "pc": share.pc_name,
+                                    "today": dt.date.today().isoformat(), "kind": "personal",
+                                    "paused": share.paused and not ctx.owner, "writable": ctx.owner})
+        # 팀원에게만 공유: 팀에 들어 있고 설정이 켜져 있으면 팀원 토큰이 있어야 볼 수 있다
+        if not ctx.owner and share.team_only and (share.auth.active or share.team) and not ctx.member:
+            return self._send_json({"error": "team_only"}, 403)
+        if path == "/events":
+            return self._stream(share.hub, ctx, lambda: share.paused and not ctx.owner, record=not ctx.owner)
+        if share.paused and not ctx.owner:
+            return self._send_json({"error": "paused"}, 503)
+        self._space(method, path, qs, share.store, share.hub, writable=ctx.owner)
+
+    # ------------------------------------------------------------ 팀 공간
+    def _team(self, method, path, qs, ctx):
+        team = self.share.team
+        if not team:
+            return self._send_json({"error": "no_team", "message": "이 PC 는 팀 호스트가 아닙니다."}, 404)
+        if method == "POST" and path in ("/join", "/login"):
+            body = self._body()
+            if path == "/join":
+                res = team.join(ctx.ip, body.get("code"), body.get("name"), body.get("pin"))
+            else:
+                res = team.login(ctx.ip, body.get("name"), body.get("pin"))
+            res.update(secret=team.secret, team=team.name)
+            return self._send_json(res)
+        if path == "/hello":   # 참여 전에 주소가 맞는지 확인용
+            return self._send_json({"app": "Dogani", "team": team.name, "host": self.share.name})
+        mid = ctx.member[0] if ctx.member else (team.owner_id if ctx.owner else None)
+        if not mid:
+            return self._send_json({"error": "not_member", "message": "팀원만 볼 수 있습니다."}, 401)
+        if path == "/me":
+            # 팀원 PC 가 주기적으로 보내는 신호: 내 노트 주소를 알리고 팀원 목록·비밀키를 받는다
+            port = int(qs.get("port", ["0"])[0] or 0)
+            ip = self.share.ip if ctx.owner else ctx.ip
+            team.touch(mid, f"{ip}:{port}" if port else "")
+            members = team.members()
+            me = next((m for m in members if m["id"] == mid), None)
+            return self._send_json({"me": me, "members": members, "secret": team.secret, "team": team.name})
+        if path == "/profile" and method == "POST":
+            body = self._body()
+            name = team.update_profile(mid, body.get("name"), body.get("pin"), body.get("old_pin"))
+            return self._send_json({"name": name})
+        if path == "/info":
+            return self._send_json({"app": "Dogani", "name": team.name, "kind": "team", "paused": False,
+                                    "writable": True, "today": dt.date.today().isoformat()})
+        if path == "/events":
+            return self._stream(team.hub, ctx, lambda: False, record=False)
+        self._space(method, path, qs, team.store, team.hub, writable=True)
+
+    # ------------------------------------------------------------ 노트 공간 공통 (개인·팀)
+    def _space(self, method, path, qs, store, hub, writable):
+        if method == "POST":
+            if not writable:
+                return self._send_json({"error": "read_only"}, 403)
+            body = self._body()
+            content = body["content"]
+            if not isinstance(content, str):
+                raise ValueError
+            try:
+                if path == "/note":
+                    d = dt.date.fromisoformat(body["date"])
+                    note = store.write(d, content, body.get("base_mtime"))
+                    event = ("changed", {"dates": [d.isoformat()]})
+                elif path == "/sched-doc":
+                    note = store.write_sched_doc(content, body.get("base_mtime"))
+                    event = ("schedule", {})
+                else:
+                    return self._send_json({"error": "not found"}, 404)
+            except OSError as e:
+                return self._send_json({"error": "write_failed", "message": str(e)}, 500)
+            if note is None:
+                return self._send_json({"error": "conflict"}, 409)
+            if event[0] == "schedule":
+                store.refresh()
+                store.pop_schedule_changed()
+            hub.broadcast(*event)
+            return self._send_json(note)
+        if path == "/note":
+            d = dt.date.fromisoformat(qs.get("date", [dt.date.today().isoformat()])[0])
+            self._send_json(store.note(d))
+        elif path == "/schedule":
+            self._send_json({"events": store.schedule()})
+        elif path == "/sched-doc":
+            self._send_json(store.sched_doc())
+        elif path == "/month":
+            y, m = map(int, qs["ym"][0].split("-"))
+            self._send_json({"ym": f"{y:04d}-{m:02d}", "days": store.month(y, m)})
+        else:
+            self._send_json({"error": "not found"}, 404)
+
+    def _stream(self, hub, ctx, paused, record):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        share = self.share
-        q = share.hub.subscribe(ip, host, record=not owner)
+        q = hub.subscribe(ctx.ip, ctx.host, record=record, user=ctx.member[1] if ctx.member else "")
         try:
-            hello = json.dumps({"paused": share.paused and not owner})
+            hello = json.dumps({"paused": paused()})
             self.wfile.write(f"retry: 3000\nevent: hello\ndata: {hello}\n\n".encode("utf-8"))
             self.wfile.flush()
             while not self.server.stopping:
@@ -433,7 +561,7 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, ConnectionError):
             pass
         finally:
-            share.hub.unsubscribe(ip, q)
+            hub.unsubscribe(ctx.ip, q)
 
 
 class _HTTPServer(ThreadingHTTPServer):
@@ -456,14 +584,18 @@ def local_ip():
 class ShareServer:
     """내 노트 HTTP 서버 + 폴더 감시. start() 가 포트를 못 열면 OSError."""
 
-    def __init__(self, port, todo_dir, paused=False, blocked=()):
+    def __init__(self, port, todo_dir, paused=False, blocked=(), name=""):
         self.port = port
         self.store = NoteStore()
         self.store.set_root(todo_dir)
         self.hub = Hub(blocked)
         self.paused = paused
         self.ip = local_ip()
-        self.name = socket.gethostname()
+        self.pc_name = socket.gethostname()
+        self.name = name or self.pc_name   # 표시 이름 (트레이 > 내 이름)
+        self.team = None          # 팀 호스트면 TeamHost
+        self.auth = TeamAuth()    # 팀원이면 접속자 토큰 검증용
+        self.team_only = True     # 팀에 들어 있으면 팀원에게만 공유
         self.running = False
         self.httpd = None
 
@@ -495,6 +627,13 @@ class ShareServer:
                 self.hub.broadcast("changed", {"dates": sorted(d.isoformat() for d in changed)})
             if self.store.pop_schedule_changed():
                 self.hub.broadcast("schedule", {})
+            team = self.team
+            if team:
+                changed = team.store.refresh()
+                if changed:
+                    team.hub.broadcast("changed", {"dates": sorted(d.isoformat() for d in changed)})
+                if team.store.pop_schedule_changed():
+                    team.hub.broadcast("schedule", {})
             time.sleep(POLL_INTERVAL)
 
     def set_root(self, path):

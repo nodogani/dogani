@@ -1,9 +1,10 @@
 """
 dogani - 사내망 todo 실시간 공유 (서버 + 뷰어 통합)
 
-- 내 노트: todo 폴더를 공유 서버로 열고(server.py), 바탕화면 오버레이에서 보고 바로 편집
-- 다른 사람 노트: 동료의 Dogani 주소를 추가하면 각각 오버레이(네비게이션 바)가 하나씩 생김 (읽기 전용)
-- 시스템 트레이(Win32 기본 메뉴)로 표시 / 공유 / 접속자 / 경로 / 자동 실행 / 종료
+- 화면: 네비게이션 바 하나 + 할일 창 + 달력 창. 바의 이름을 누르면 공간(공용/개인)을 고른다
+- 개인 공간: 내 노트(todo 폴더를 공유 서버로 열고 바로 편집) / 팀원·다른 사람 노트(읽기 전용)
+- 공용 공간: 팀 호스트 PC 에 있는 공용 노트·공용 일정 (팀원 모두 편집). team.py 참고
+- 시스템 트레이(Win32 기본 메뉴)로 표시 / 이름 / 팀 / 공유 / 접속자 / 경로 / 자동 실행 / 종료
 """
 import argparse
 import ctypes
@@ -11,9 +12,13 @@ import json
 import os
 import socket
 import sys
+import threading
 import time
+import urllib.error
+import urllib.request
 import winreg
 from ctypes import wintypes
+from urllib.parse import quote
 
 import pystray
 from PIL import Image, ImageDraw
@@ -24,33 +29,48 @@ from PySide6.QtWebEngineCore import (QWebEnginePage, QWebEngineProfile, QWebEngi
                                       QWebEngineUrlRequestInterceptor, QWebEngineUrlRequestJob, QWebEngineUrlScheme,
                                       QWebEngineUrlSchemeHandler)
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog, QLineEdit, QMessageBox, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QInputDialog,
+                               QLabel, QLineEdit, QMessageBox, QVBoxLayout, QWidget)
 
-from server import CLIENT_KEY, HOST_HEADER, KEY_HEADER, ShareServer
+import liveupdate
+from server import CLIENT_KEY, HOST_HEADER, KEY_HEADER, TOKEN_HEADER, USER_HEADER, ShareServer
+from team import NAME_MAX, TeamHost, clean_name, valid_pin
 
 APP_NAME = "Dogani"
 CONFIG_DIR = os.environ.get("DOGANI_HOME") or os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Dogani")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "dogani.json")
-BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))  # exe 패키징 시 _MEIPASS
+TEAM_DIR = os.path.join(CONFIG_DIR, "team")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # exe 면 런처(launcher.py)가 고른 코드 폴더
 UI_DIR = os.path.join(BASE_DIR, "ui")
 DEFAULT_PORT = 8765
 OPACITY_LEVELS = [100, 90, 80, 70, 60]
-ME = "me"  # 내 노트 오버레이 키 (다른 사람은 "ip:port")
+ME = "me"      # 내 노트 공간 키
+TEAM = "team"  # 공용 공간 키 (팀원은 "m:팀원ID", 주소로 추가한 사람은 "ip:port")
+TEAM_POLL_MS = 20_000
 
 STATUS_LABELS = {
     "online": "접속 중",
     "offline": "연결 끊김",
     "paused": "공유 일시 중지됨",
     "blocked": "차단됨",
+    "team_only": "팀원만 볼 수 있음",
 }
+TEAM_STATUS = {"online": "연결됨", "offline": "호스트 연결 끊김", "logged_out": "다시 로그인 필요"}
 
+EMPTY_TEAM = {"host": "", "token": "", "id": "", "secret": "", "team": "", "members": []}
 DEFAULT_CONFIG = {
     "port": DEFAULT_PORT,
     "todo_dir": "",
+    "name": "",           # 내 이름 (팀원·동료에게 보이는 이름)
     "paused": False,      # 내 노트 공유 일시 중지
+    "team_only": True,    # 팀에 들어 있으면 팀원에게만 내 노트 공유
     "blocked": [],
-    "servers": [],        # 다른 사람 주소 목록 ["192.168.0.10:8765", ...]
-    "overlays": {},       # 키(me / 주소) -> {"visible", "pos", "panel"}
+    "servers": [],        # 주소로 직접 추가한 사람 ["192.168.0.10:8765", ...]
+    "team": dict(EMPTY_TEAM),
+    "team_host": False,   # 이 PC 가 팀 호스트
+    "visible": True,
+    "space": ME,          # 지금 보고 있는 공간
+    "windows": {},        # nav / note / cal -> {"pos", "panel", "open"}
     "on_top": False,      # False: 바탕화면에 고정 (Win+D 에도 남아 있음)
     "opacity": 100,
     "theme": "light",
@@ -72,7 +92,23 @@ def load_config():
     if saved is None:
         saved = migrate_old_config()
     cfg.update(saved)
+    cfg["team"] = {**EMPTY_TEAM, **(cfg.get("team") or {})}
+    migrate_windows(cfg)
+    if not cfg["name"]:
+        cfg["name"] = clean_name(os.environ.get("USERNAME") or socket.gethostname())
     return cfg
+
+
+def migrate_windows(cfg):
+    """v26.11.06 이전: 사람마다 네비게이션 바(overlays) → 이제 바 하나(windows)"""
+    old = cfg.pop("overlays", None)
+    if cfg["windows"] or not old:
+        return
+    me = old.get(ME) or {}
+    cfg["windows"] = {"nav": {"pos": me.get("pos")}}
+    for mode in ("note", "cal"):
+        if isinstance(me.get(mode), dict):
+            cfg["windows"][mode] = {k: me[mode].get(k) for k in ("pos", "panel", "open")}
 
 
 def migrate_old_config():
@@ -87,15 +123,10 @@ def migrate_old_config():
     for k in ("on_top", "opacity", "theme"):
         if k in old_client:
             cfg[k] = old_client[k]
-    overlays = {}
-    if old_owner or old_server:
-        overlays[ME] = {"visible": old_server.get("overlay", True), "pos": old_owner.get("pos"),
-                        "panel": old_owner.get("panel")}
+    if old_owner.get("pos"):
+        cfg["windows"] = {"nav": {"pos": old_owner["pos"]}}
     if old_client.get("server"):
         cfg["servers"] = [old_client["server"]]
-        overlays[old_client["server"]] = {"visible": old_client.get("visible", True), "pos": old_client.get("pos"),
-                                          "panel": old_client.get("panel")}
-    cfg["overlays"] = overlays
     return cfg
 
 
@@ -114,6 +145,33 @@ def normalize_server(text):
     if ":" not in text:
         text = f"{text}:{DEFAULT_PORT}"
     return text
+
+
+# ---------------------------------------------------------------- http (팀 호스트와 통신)
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 사내 프록시를 타지 않게
+
+
+def http_json(server, path, body=None, token="", name="", timeout=4):
+    """→ (HTTP 상태, dict). 연결 실패면 상태 0"""
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(f"http://{server}{path}", data=data, method="POST" if data else "GET")
+    req.add_header(KEY_HEADER, CLIENT_KEY)
+    req.add_header(HOST_HEADER, socket.gethostname()[:64])
+    req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header(TOKEN_HEADER, token)
+    if name:
+        req.add_header(USER_HEADER, quote(name))
+    try:
+        with _opener.open(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except ValueError:
+            return e.code, {}
+    except (urllib.error.URLError, OSError, ValueError):
+        return 0, {}
 
 
 # ---------------------------------------------------------------- autostart
@@ -258,7 +316,8 @@ class Tray(QObject):
         for ip, c in order:
             if ip in blocked:
                 continue
-            name = f"{ip} ({c['host']})" if c["host"] else ip
+            who = c.get("user") or c["host"]
+            name = f"{who} ({ip})" if who else ip
             if not c["active"]:
                 name += f"  - 마지막 {time.strftime('%m/%d %H:%M', time.localtime(c['last_seen']))}"
             items.append(Item(name, pystray.Menu(Item("연결 끊고 차단", self.emit("block", ip))),
@@ -267,8 +326,9 @@ class Tray(QObject):
             if items:
                 items.append(pystray.Menu.SEPARATOR)
             for ip in sorted(blocked):
-                host = clients.get(ip, {}).get("host", "")
-                items.append(Item(f"[차단됨] {ip}" + (f" ({host})" if host else ""),
+                c = clients.get(ip, {})
+                who = c.get("user") or c.get("host", "")
+                items.append(Item(f"[차단됨] {ip}" + (f" ({who})" if who else ""),
                                   pystray.Menu(Item("차단 해제", self.emit("unblock", ip)))))
         return items or [Item("(접속 기록 없음)", None, enabled=False)]
 
@@ -277,19 +337,66 @@ class Tray(QObject):
         app = self.app
         items = []
         for addr in app.cfg["servers"]:
-            ov = app.overlays.get(addr)
-            label = ov.label if ov and ov.label != addr else addr
-            if ov and ov.label != addr:
-                label = f"{ov.label} ({addr})"
-            label += f"  - {STATUS_LABELS[app.status.get(addr, 'offline')]}"
+            name = app.names.get(addr)
+            label = f"{name} ({addr})" if name else addr
+            label += f"  - {STATUS_LABELS.get(app.status.get(addr, 'offline'), '')}"
             items.append(Item(label, pystray.Menu(
-                Item("표시", self.emit("toggle_visible", addr), checked=lambda i, a=addr: app.is_visible(a)),
+                Item("보기", self.emit("select_space", addr)),
                 Item("삭제", self.emit("remove_server", addr)),
-            ), checked=lambda i, a=addr: app.is_visible(a)))
+            )))
         if items:
             items.append(pystray.Menu.SEPARATOR)
         items.append(Item("추가...", self.emit("add_server")))
         return items
+
+    def member_items(self):
+        Item = pystray.MenuItem
+        team = self.app.share.team if self.app.share else None
+        if not team:
+            return [Item("(없음)", None, enabled=False)]
+        items = []
+        for m in team.members():
+            if m["admin"]:
+                items.append(Item(f"{m['name']}  - 관리자(이 PC)", None, enabled=False))
+                continue
+            state = "PIN 초기화됨 (다시 참여 대기)" if m["pending"] else "접속 중" if m["online"] else "꺼짐"
+            items.append(Item(f"{m['name']}  - {state}", pystray.Menu(
+                Item("PIN 초기화 (잊어버렸을 때)", self.emit("reset_pin", m["id"])),
+                Item("팀에서 내보내기", self.emit("kick", m["id"])),
+            )))
+        return items
+
+    def team_menu(self):
+        Item = pystray.MenuItem
+        app = self.app
+        t = app.cfg["team"]
+        if app.share and app.share.team:
+            team = app.share.team
+            return pystray.Menu(
+                Item(f"참여 코드 {team.code}  (클릭 시 복사)", self.emit("copy_code")),
+                Item(f"호스트 주소 {app.share.address}  (클릭 시 복사)", self.emit("copy_address")),
+                Item("참여 코드 새로 만들기", self.emit("renew_code")),
+                pystray.Menu.SEPARATOR,
+                Item("팀원", pystray.Menu(lambda: self.member_items())),
+                Item("팀 이름 바꾸기...", self.emit("rename_team")),
+                Item("공용 폴더 열기", self.emit("open_team_dir")),
+                pystray.Menu.SEPARATOR,
+                Item("팀 호스트 끄기", self.emit("stop_host")),
+            )
+        if t.get("token"):
+            return pystray.Menu(
+                Item(f"호스트 {t['host']}  - {TEAM_STATUS.get(app.team_status, '')}", None, enabled=False),
+                Item("PIN 바꾸기...", self.emit("change_pin")),
+                Item("다시 로그인...", self.emit("login_team")),
+                pystray.Menu.SEPARATOR,
+                Item("팀 나가기 (이 PC 에서 로그아웃)", self.emit("leave_team")),
+            )
+        return pystray.Menu(
+            Item("팀 참여... (참여 코드)", self.emit("join_team")),
+            Item("로그인... (다른 PC 에서 참여했던 계정)", self.emit("login_team")),
+            pystray.Menu.SEPARATOR,
+            Item("이 PC 를 팀 호스트로 (새 팀 만들기)", self.emit("start_host"), enabled=bool(app.share)),
+        )
 
     def build_menu(self):
         Item = pystray.MenuItem
@@ -301,22 +408,32 @@ class Tray(QObject):
                 Item(f"{share.address}  (클릭 시 주소 복사)", self.emit("copy_address")),
                 pystray.Menu.SEPARATOR,
                 Item("공유 일시 중지", self.emit("toggle_pause"), checked=lambda i: share.paused),
-                Item("접속 IP", pystray.Menu(lambda: self.client_items())),
+                Item("팀원에게만 공유", self.emit("toggle_team_only"), checked=lambda i: cfg["team_only"],
+                     enabled=app.in_team()),
+                Item("접속자", pystray.Menu(lambda: self.client_items())),
             )
         else:
             share_label = "공유 꺼짐 (포트 사용 중)"
             share_menu = pystray.Menu(Item(f"포트 {cfg['port']}을(를) 열 수 없습니다", None, enabled=False))
         todo_dir = cfg["todo_dir"] or "(경로 미지정)"
+        if share and share.team:
+            team_label = f"팀스페이스: {share.team.name} (호스트)"
+        elif cfg["team"].get("token"):
+            team_label = f"팀스페이스: {cfg['team'].get('team') or '팀'} ({TEAM_STATUS.get(app.team_status, '')})"
+        else:
+            team_label = "팀스페이스: 참여 안 함"
         return [
-            Item("내 노트 표시", self.emit("toggle_visible", ME), checked=lambda i: app.is_visible(ME), default=True),
+            Item("Dogani 표시", self.emit("toggle_visible"), checked=lambda i: cfg["visible"], default=True),
+            Item(f"내 이름: {cfg['name']}", pystray.Menu(Item("이름 바꾸기...", self.emit("rename")))),
+            Item(team_label, self.team_menu()),
+            pystray.Menu.SEPARATOR,
             Item(f"내 노트 {share_label}", share_menu, checked=lambda i: bool(share) and not share.paused, radio=True),
             Item("todo 경로", pystray.Menu(
                 Item(todo_dir, self.emit("open_dir")),
                 pystray.Menu.SEPARATOR,
                 Item("찾아보기...", self.emit("browse_dir")),
             )),
-            pystray.Menu.SEPARATOR,
-            Item("다른 사람 노트", pystray.Menu(lambda: self.server_items())),
+            Item("주소로 추가한 노트", pystray.Menu(lambda: self.server_items())),
             pystray.Menu.SEPARATOR,
             Item("바탕화면에 고정", self.emit("set_on_top", False), checked=lambda i: not cfg["on_top"], radio=True),
             Item("항상 위에 표시", self.emit("set_on_top", True), checked=lambda i: cfg["on_top"], radio=True),
@@ -328,6 +445,7 @@ class Tray(QObject):
             Item("다크 테마", self.emit("toggle_theme"), checked=lambda i: cfg["theme"] == "dark"),
             Item("Windows 시작 시 자동 실행", self.emit("toggle_autostart"), checked=lambda i: is_autostart()),
             pystray.Menu.SEPARATOR,
+            Item(lambda i: liveupdate.version_text(), None, enabled=False),
             Item("종료", self.emit("quit")),
         ]
 
@@ -337,7 +455,7 @@ class Tray(QObject):
         self.icon.icon = make_icon_image(ICON_COLORS[key])
         if share:
             state = "공유 일시 중지" if share.paused else "공유 중"
-            self.icon.title = f"Dogani - 내 노트 {share.address} ({state})"
+            self.icon.title = f"Dogani {liveupdate.version_text()} - {self.app.cfg['name']} {share.address} ({state})"
         else:
             self.icon.title = "Dogani - 내 노트 공유 꺼짐"
 
@@ -355,9 +473,74 @@ class Tray(QObject):
         self.icon.stop()
 
 
+# ---------------------------------------------------------------- dialogs (Windows 기본 위젯)
+class TeamDialog(QDialog):
+    """팀 참여(join) / 로그인(login) / PIN 바꾸기(pin)"""
+
+    def __init__(self, mode, host="", name=""):
+        super().__init__(None, Qt.WindowType.WindowStaysOnTopHint)
+        self.mode = mode
+        self.setWindowTitle({"join": "팀 참여", "login": "팀 로그인", "pin": "PIN 바꾸기"}[mode])
+        form = QFormLayout()
+        self.host = QLineEdit(host, placeholderText="예) 192.168.0.10  (호스트 트레이 > 팀스페이스에서 확인)")
+        self.code = QLineEdit(placeholderText="숫자 6자리", maxLength=6)
+        self.name = QLineEdit(name, maxLength=NAME_MAX)
+        self.old_pin = QLineEdit(echoMode=QLineEdit.EchoMode.Password, maxLength=8)
+        self.pin = QLineEdit(echoMode=QLineEdit.EchoMode.Password, maxLength=8, placeholderText="숫자 4~8자리")
+        self.pin2 = QLineEdit(echoMode=QLineEdit.EchoMode.Password, maxLength=8)
+        if mode in ("join", "login"):
+            form.addRow("호스트 주소", self.host)
+        if mode == "join":
+            form.addRow("참여 코드", self.code)
+        if mode in ("join", "login"):
+            form.addRow("내 이름", self.name)
+        if mode == "pin":
+            form.addRow("지금 PIN", self.old_pin)
+        form.addRow("PIN" if mode != "pin" else "새 PIN", self.pin)
+        if mode != "login":
+            form.addRow("PIN 확인", self.pin2)
+        hint = {
+            "join": "참여 코드는 팀 호스트(관리자) PC 트레이에 있습니다.\n"
+                    "PIN 은 다른 PC 에서 로그인할 때만 다시 묻습니다.",
+            "login": "다른 PC 에서 참여할 때 정한 이름과 PIN 을 입력하세요.\n"
+                     "PIN 을 잊었으면 관리자에게 'PIN 초기화'를 부탁한 뒤 '팀 참여'로 다시 들어오세요.",
+            "pin": "",
+        }[mode]
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        if hint:
+            layout.addWidget(QLabel(hint))
+        self.error = QLabel()
+        self.error.setStyleSheet("color: #c0392b")
+        layout.addWidget(self.error)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.check)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.handler = None
+        self.setMinimumWidth(380)
+
+    def check(self):
+        if self.mode in ("join", "login") and not normalize_server(self.host.text()):
+            return self.error.setText("호스트 주소를 입력하세요.")
+        if self.mode == "join" and not self.code.text().strip():
+            return self.error.setText("참여 코드를 입력하세요.")
+        if self.mode in ("join", "login") and not clean_name(self.name.text()):
+            return self.error.setText("이름을 입력하세요.")
+        if not valid_pin(self.pin.text()):
+            return self.error.setText("PIN 은 숫자 4~8자리입니다.")
+        if self.mode != "login" and self.pin.text() != self.pin2.text():
+            return self.error.setText("PIN 확인이 맞지 않습니다.")
+        msg = self.handler(self) if self.handler else None
+        if msg:
+            self.error.setText(msg)
+        else:
+            self.accept()
+
+
 # ---------------------------------------------------------------- overlay web view
 class Bridge(QObject):
-    """JS(app.js) ↔ 파이썬 연결 객체 (오버레이 창마다 하나)."""
+    """JS(app.js) ↔ 파이썬 연결 객체 (창마다 하나)."""
 
     def __init__(self, win):
         super().__init__()
@@ -383,33 +566,44 @@ class Bridge(QObject):
     def setExpanded(self, expanded):
         self.win.set_expanded(expanded)
 
-    @Slot(str)
-    def setStatus(self, status):
+    @Slot(str, str)
+    def setStatus(self, key, status):
         if status in STATUS_LABELS:
-            self.win.status_changed.emit(self.win.key, status)
+            self.win.app.on_status(key, status)
 
-    @Slot(str)
-    def setName(self, name):
-        self.win.label = name or self.win.server
-        if name:
-            self.win.app.names[self.win.key] = name
+    @Slot(str, str)
+    def setName(self, key, name):
+        self.win.app.on_peer_name(key, name)
 
     @Slot(str)
     def togglePanel(self, mode):
         if mode in ("note", "cal"):
-            self.win.app.toggle_panel(self.win.key, mode)
+            self.win.app.toggle_panel(mode)
 
     @Slot()
     def closePanel(self):
-        self.win.app.close_panel(self.win.key, self.win.mode)
+        self.win.app.close_panel(self.win.mode)
 
     @Slot(str)
     def openNote(self, date):
-        self.win.app.open_note(self.win.key, date)
+        self.win.app.open_note(date)
+
+    @Slot(str, str, bool)
+    def noteDateChanged(self, date, title, is_today):
+        self.win.app.note_date_changed(date, title, is_today)
+
+    @Slot(int)
+    def stepNote(self, step):
+        self.win.app.step_note(step)
 
     @Slot(str)
-    def noteDateChanged(self, date):
-        self.win.app.note_date_changed(self.win.key, date)
+    def selectSpace(self, key):
+        self.win.app.select_space(key)
+
+    @Slot(str)
+    def action(self, name):
+        if name in ("join_team", "login_team", "rename", "add_server", "start_host"):
+            self.win.app.on_command(name, None)
 
     @Slot(str)
     def openUrl(self, url):
@@ -449,16 +643,21 @@ class UiSchemeHandler(QWebEngineUrlSchemeHandler):
 
 
 class ClientHeaders(QWebEngineUrlRequestInterceptor):
-    """서버로 가는 모든 요청(fetch, SSE)에 Dogani 식별 헤더를 붙인다."""
+    """서버로 가는 모든 요청(fetch, SSE)에 Dogani 식별 헤더 + 내 이름 + 팀원 토큰을 붙인다."""
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
         self.host = socket.gethostname().encode("utf-8", "ignore")[:64]
 
     def interceptRequest(self, info):
         if info.requestUrl().scheme() in ("http", "https"):
+            cfg = self.app.cfg
             info.setHttpHeader(KEY_HEADER.encode(), CLIENT_KEY.encode())
             info.setHttpHeader(HOST_HEADER.encode(), self.host)
+            info.setHttpHeader(USER_HEADER.encode(), quote(cfg["name"]).encode())
+            if cfg["team"].get("token"):
+                info.setHttpHeader(TOKEN_HEADER.encode(), cfg["team"]["token"].encode())
 
 
 class Page(QWebEnginePage):
@@ -480,13 +679,13 @@ def qwebchannel_js():
     return data
 
 
-def setup_profile(parent):
-    """모든 오버레이가 같이 쓰는 기본 프로필에 UI 스킴과 헤더를 한 번만 설치."""
+def setup_profile(app):
+    """모든 창이 같이 쓰는 기본 프로필에 UI 스킴과 헤더를 한 번만 설치."""
     profile = QWebEngineProfile.defaultProfile()
-    parent.scheme_handler = UiSchemeHandler(parent)
-    profile.installUrlSchemeHandler(UI_SCHEME, parent.scheme_handler)
-    parent.headers = ClientHeaders(parent)
-    profile.setUrlRequestInterceptor(parent.headers)
+    app.scheme_handler = UiSchemeHandler(app)
+    profile.installUrlSchemeHandler(UI_SCHEME, app.scheme_handler)
+    app.headers = ClientHeaders(app)
+    profile.setUrlRequestInterceptor(app.headers)
     script = QWebEngineScript()
     script.setName("qwebchannel")
     script.setSourceCode(qwebchannel_js())
@@ -495,8 +694,8 @@ def setup_profile(parent):
     profile.scripts().insert(script)
 
 
-PANEL_DEFAULT_SIZE = {"note": (440, 640), "cal": (400, 420)}
-PANEL_MIN_SIZE = {"note": (400, 300), "cal": (340, 300)}
+PANEL_DEFAULT_SIZE = {"note": (440, 640), "cal": (400, 440)}
+PANEL_MIN_SIZE = {"note": (300, 240), "cal": (340, 300)}
 
 
 class ResizeGhost(QWidget):
@@ -526,23 +725,16 @@ VK_LBUTTON = 0x01
 
 
 class Overlay(QWidget):
-    """바탕화면 오버레이 창. 노트 하나(내 노트 또는 다른 사람)마다
-    네비게이션 바(mode="nav") 하나와, 따로 열고 닫는 할일(note)·달력(cal) 창이 있다."""
+    """바탕화면 창. mode = nav(네비게이션 바, 하나뿐) | note(할일 창) | cal(달력 창)"""
 
-    status_changed = Signal(str, str)
-
-    def __init__(self, app, key, server, index, mode="nav"):
+    def __init__(self, app, mode):
         super().__init__()
         self.app = app
-        self.key = key
-        self.server = server
         self.mode = mode
-        self.label = "내 노트" if key == ME else server
-        self.index = index
         self.expanded = False
         self.nav_size = QSize(200, 60)
 
-        self.setWindowTitle(f"Dogani - {self.label}" + {"note": " 할일", "cal": " 달력"}.get(mode, ""))
+        self.setWindowTitle(APP_NAME + {"note": " 할일", "cal": " 달력"}.get(mode, ""))
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.apply_flags()
 
@@ -570,19 +762,17 @@ class Overlay(QWidget):
         self.view.load(QUrl("dogani://ui/index.html"))
 
     @property
-    def ocfg(self):
-        """이 창의 위치·크기 설정 (네비게이션 바는 노트 설정 그대로, 할일/달력 창은 그 아래 하위 항목)"""
-        ocfg = self.app.overlay_cfg(self.key)
-        if self.mode == "nav":
-            return ocfg
-        return self.app.panel_cfg(self.key, self.mode)
+    def wcfg(self):
+        """이 창의 위치·크기 설정"""
+        return self.app.win_cfg(self.mode)
 
     def js_config(self):
-        label = "내 노트" if self.key == ME else self.app.names.get(self.key, "")
-        cfg = {"server": self.server, "theme": self.app.cfg["theme"], "mine": self.key == ME,
-               "label": label, "mode": self.mode, "open": self.app.open_panels(self.key)}
-        if self.mode == "note":
-            cfg["date"] = self.ocfg.pop("date", None)
+        cfg = self.app.js_common()
+        cfg["mode"] = self.mode
+        if self.mode == "nav":
+            cfg.update(self.app.js_nav())
+        elif self.mode == "note":
+            cfg["date"] = self.wcfg.pop("date", None)
         return cfg
 
     # -- window flags
@@ -610,21 +800,20 @@ class Overlay(QWidget):
             set_owner(hwnd, target)
 
     def restore_position(self):
-        pos = self.ocfg.get("pos")
+        pos = self.wcfg.get("pos")
         if pos and QGuiApplication.screenAt(QPoint(pos[0] + 30, pos[1] + 20)):
             self.move(pos[0], pos[1])
             return
-        nav = self.app.overlays.get(self.key)
+        nav = self.app.nav
         if self.mode != "nav" and nav:
             # 처음 여는 창은 네비게이션 바 바로 아래: 할일 창은 그대로, 달력 창은 할일 창 자리 왼쪽
-            w = (self.ocfg.get("panel") or PANEL_DEFAULT_SIZE[self.mode])[0]
+            w = (self.wcfg.get("panel") or PANEL_DEFAULT_SIZE[self.mode])[0]
             x = nav.x() - (w - 10 if self.mode == "cal" else 0)
-            self.move(x, nav.y() + nav.height() - 10)
+            self.move(x, nav.y() + nav.nav_size.height() - 10)
             self.keep_on_screen(nav.pos())
             return
-        # 처음 뜨는 창은 화면 오른쪽 위부터 아래로 차례대로
         geo = QGuiApplication.primaryScreen().availableGeometry()
-        self.move(geo.right() - 280, geo.top() + 20 + self.index * 56)
+        self.move(geo.right() - 420, geo.top() + 20)
 
     # -- size
     def set_nav_size(self, w, h):
@@ -636,8 +825,8 @@ class Overlay(QWidget):
     def set_expanded(self, expanded):
         self.expanded = expanded
         if expanded:
-            w, h = self.ocfg.get("panel") or PANEL_DEFAULT_SIZE.get(self.mode, (440, 640))
-            mw, mh = PANEL_MIN_SIZE.get(self.mode, (400, 300))  # 상단 바에 날짜 이동이 들어가므로
+            w, h = self.wcfg.get("panel") or PANEL_DEFAULT_SIZE.get(self.mode, (440, 640))
+            mw, mh = PANEL_MIN_SIZE.get(self.mode, (300, 240))
             self.setMinimumSize(mw, mh)
             self.resize(max(w, mw), max(h, mh))
             self.keep_on_screen()
@@ -686,152 +875,407 @@ class Overlay(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self.expanded:
-            self.ocfg["panel"] = [self.width(), self.height()]
+            self.wcfg["panel"] = [self.width(), self.height()]
             self.app.save_later()
 
     def moveEvent(self, event):
         super().moveEvent(event)
-        self.ocfg["pos"] = [self.x(), self.y()]
+        self.wcfg["pos"] = [self.x(), self.y()]
         self.app.save_later()
 
     def push_config(self, **values):
         self.view.page().runJavaScript(f"window.App && App.configure({json.dumps(values)})")
 
+    def call(self, fn, *args):
+        self.view.page().runJavaScript(f"window.App && App.{fn}({', '.join(json.dumps(a) for a in args)})")
+
 
 # ---------------------------------------------------------------- app
 class DoganiApp(QObject):
+    team_result = Signal(int, object)   # 팀 호스트 응답 (작업 스레드 → 메인 스레드)
+
     def __init__(self, qapp, cfg):
         super().__init__()
         self.qapp = qapp
         self.cfg = cfg
-        self.status = {}    # 키 -> online/offline/...
-        self.overlays = {}  # 키 -> Overlay (네비게이션 바)
-        self.panels = {}    # (키, "note" | "cal") -> Overlay (할일/달력 창)
-        self.names = {}     # 키 -> 상대 PC 이름
+        self.status = {}     # 공간 키 -> 창에서 알려 준 연결 상태
+        self.names = {}      # 주소로 추가한 사람 -> 상대가 알려 준 이름
+        self.nav = None      # 네비게이션 바 (하나)
+        self.panels = {}     # "note" | "cal" -> Overlay
+        self.note_label = None   # 할일 창이 보여주는 날짜 {date, title, today}
+        self.team_status = "offline"
+        self.team_polling = False
         self.save_timer = QTimer(self, singleShot=True, interval=800, timeout=lambda: save_config(self.cfg))
         setup_profile(self)
 
-        self.share = ShareServer(cfg["port"], cfg["todo_dir"], cfg["paused"], cfg["blocked"])
+        self.share = ShareServer(cfg["port"], cfg["todo_dir"], cfg["paused"], cfg["blocked"], cfg["name"])
+        self.share.team_only = cfg["team_only"]
         try:
             self.share.start()
         except OSError:
             self.share = None
+        if self.share and cfg["team_host"]:
+            self.start_host(quiet=True)
+        self.apply_team_auth()
 
         self.tray = Tray(self)
         self.tray.command.connect(self.on_command)
+        liveupdate.install(self)
+        self.team_result.connect(self.on_team_result)
+        self.team_timer = QTimer(self, interval=TEAM_POLL_MS, timeout=self.poll_team)
 
     def save_later(self):
         self.save_timer.start()
 
-    def overlay_cfg(self, key):
-        return self.cfg["overlays"].setdefault(key, {"visible": True, "pos": None, "panel": None})
-
-    def is_visible(self, key):
-        return self.overlay_cfg(key).get("visible", True)
-
-    def server_of(self, key):
-        return f"127.0.0.1:{self.cfg['port']}" if key == ME else key
-
-    def keys(self):
-        return [ME] + list(self.cfg["servers"])
+    def win_cfg(self, mode):
+        return self.cfg["windows"].setdefault(mode, {"pos": None, "panel": None, "open": False})
 
     def windows(self):
-        return list(self.overlays.values()) + list(self.panels.values())
+        return ([self.nav] if self.nav else []) + list(self.panels.values())
 
-    # -- 할일/달력 창 (네비게이션 바 버튼으로 각각 따로 열고 닫음)
-    def panel_cfg(self, key, mode):
-        return self.overlay_cfg(key).setdefault(mode, {"open": False, "pos": None, "panel": None})
+    def in_team(self):
+        return bool(self.cfg["team"].get("token"))
 
-    def open_panels(self, key):
-        return {m: (key, m) in self.panels for m in ("note", "cal")}
+    # ------------------------------------------------------------ spaces (공용 / 개인)
+    def spaces(self):
+        cfg, t = self.cfg, self.cfg["team"]
+        out = []
+        if self.in_team():
+            out.append({"key": TEAM, "group": "team", "name": t.get("team") or "팀 공용", "server": t["host"],
+                        "prefix": "/api/team", "kind": "team",
+                        "status": (self.status.get(TEAM) or "online") if self.team_status == "online" else
+                        ("blocked" if self.team_status == "logged_out" else "offline")})
+        out.append({"key": ME, "group": "me", "name": cfg["name"], "server": f"127.0.0.1:{cfg['port']}",
+                    "prefix": "/api", "kind": "me", "status": "online" if self.share else "offline",
+                    "sub": "" if self.share else "공유 꺼짐"})
+        seen = set()
+        for m in t.get("members") or []:
+            if m["id"] == t.get("id"):
+                continue
+            addr = m.get("addr", "")
+            seen.add(addr)
+            key = "m:" + m["id"]
+            st = self.status.get(key) or ("online" if m.get("online") and addr else "offline")
+            out.append({"key": key, "group": "member", "name": m["name"], "server": addr, "prefix": "/api",
+                        "kind": "peer", "status": st if m.get("online") else "offline",
+                        "sub": "" if addr else "노트 공유 안 함", "disabled": not addr})
+        for addr in cfg["servers"]:
+            if addr in seen:
+                continue
+            out.append({"key": addr, "group": "other", "name": self.names.get(addr) or addr.removesuffix(f":{DEFAULT_PORT}"),
+                        "server": addr, "prefix": "/api", "kind": "peer",
+                        "status": self.status.get(addr, "offline"), "sub": addr})
+        for s in out:
+            s["status"] = s.get("status") or "offline"
+        return out
 
-    def show_panel(self, key, mode):
-        self.panel_cfg(key, mode)["open"] = True
-        win = self.panels.get((key, mode))
+    def current_space(self):
+        spaces = self.spaces()
+        cur = next((s for s in spaces if s["key"] == self.cfg["space"] and not s.get("disabled")), None)
+        return cur or next(s for s in spaces if s["key"] == ME)
+
+    def team_space(self):
+        """개인 공간 달력에 같이 보여줄 공용 일정 출처"""
+        if not self.in_team() or self.team_status == "logged_out":
+            return None
+        return {"server": self.cfg["team"]["host"], "prefix": "/api/team"}
+
+    def js_common(self):
+        return {"theme": self.cfg["theme"], "space": self.current_space(), "team": self.team_space()}
+
+    def js_nav(self):
+        return {"spaces": self.spaces(), "open": self.open_panels(), "noteLabel": self.note_label,
+                "me": self.cfg["name"], "teamState": "host" if self.share and self.share.team else
+                ("joined" if self.in_team() else "none")}
+
+    def push_spaces(self):
+        common = self.js_common()
+        for win in self.panels.values():
+            win.push_config(**common)
+        if self.nav:
+            self.nav.push_config(**common, **self.js_nav())
+
+    def select_space(self, key):
+        if key == self.cfg["space"]:
+            return
+        self.cfg["space"] = key
+        self.save_later()
+        self.push_spaces()
+
+    def on_status(self, key, status):
+        if self.status.get(key) == status:
+            return
+        self.status[key] = status
+        if self.nav:
+            self.nav.push_config(spaces=self.spaces())
+
+    def on_peer_name(self, key, name):
+        if name and key in self.cfg["servers"] and self.names.get(key) != name:
+            self.names[key] = name
+            self.push_spaces()
+
+    # ------------------------------------------------------------ team (client)
+    def apply_team_auth(self):
+        if self.share:
+            t = self.cfg["team"]
+            self.share.auth.update(t.get("secret") if t.get("token") else "", t.get("members"))
+            self.share.team_only = self.cfg["team_only"]
+            self.share.name = self.cfg["name"]
+
+    def poll_team(self):
+        t = self.cfg["team"]
+        if not t.get("token") or self.team_polling:
+            return
+        self.team_polling = True
+        host, token, name = t["host"], t["token"], self.cfg["name"]
+        port = self.cfg["port"] if self.share else 0
+
+        def work():
+            status, res = http_json(host, f"/api/team/me?port={port}", token=token, name=name)
+            self.team_result.emit(status, res)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_team_result(self, status, res):
+        self.team_polling = False
+        t = self.cfg["team"]
+        if not t.get("token"):
+            return
+        prev = self.team_status
+        if status == 200:
+            self.team_status = "online"
+            t["members"] = res.get("members") or []
+            t["secret"] = res.get("secret") or t["secret"]
+            t["team"] = res.get("team") or t["team"]
+            me = res.get("me")
+            if me and me.get("name") and me["name"] != self.cfg["name"]:
+                self.cfg["name"] = me["name"]   # 다른 PC 에서 바꾼 이름
+        elif status == 401:
+            self.team_status = "logged_out"
+            if prev != "logged_out":
+                self.tray.notify("팀 로그인이 풀렸습니다. (내보내졌거나 PIN 이 초기화됨)\n트레이 > 팀스페이스에서 다시 로그인하세요.")
+        else:
+            self.team_status = "offline"
+        self.apply_team_auth()
+        self.save_later()
+        self.push_spaces()
+
+    def team_request(self, host, path, body):
+        """대화상자에서 쓰는 동기 요청 → (성공 여부, 응답 또는 오류 문구)"""
+        status, res = http_json(host, path, body, token=self.cfg["team"].get("token", ""), name=self.cfg["name"])
+        if status == 200:
+            return True, res
+        if status == 0:
+            return False, f"{host} 에 연결할 수 없습니다. 주소와 호스트 PC 의 Dogani 가 켜져 있는지 확인하세요."
+        if res.get("error") == "no_team":
+            return False, "그 PC 는 팀 호스트가 아닙니다."
+        return False, res.get("message") or f"실패했습니다. (HTTP {status})"
+
+    def set_session(self, host, res):
+        self.cfg["team"] = {**EMPTY_TEAM, "host": host, "token": res["token"], "id": res["id"],
+                            "secret": res.get("secret", ""), "team": res.get("team", "")}
+        self.cfg["name"] = res.get("name") or self.cfg["name"]
+        self.team_status = "online"
+        self.apply_team_auth()
+        save_config(self.cfg)
+        self.poll_team()
+        self.push_spaces()
+        if hasattr(self, "tray"):   # 시작할 때(트레이 만들기 전) 호스트를 여는 경우
+            self.tray.update()
+
+    def join_team(self, mode):
+        t = self.cfg["team"]
+        dlg = TeamDialog(mode, "" if t.get("host", "").startswith("127.") else t.get("host", ""), self.cfg["name"])
+
+        def handler(d):
+            host = normalize_server(d.host.text())
+            if mode == "join":
+                ok, res = self.team_request(host, "/api/team/join",
+                                            {"code": d.code.text().strip(), "name": d.name.text(), "pin": d.pin.text()})
+            else:
+                ok, res = self.team_request(host, "/api/team/login", {"name": d.name.text(), "pin": d.pin.text()})
+            if not ok:
+                return res
+            self.set_session(host, res)
+            return None
+
+        dlg.handler = handler
+        if dlg.exec():
+            self.tray.notify(f"{self.cfg['team'].get('team') or '팀'}에 {self.cfg['name']}(으)로 들어왔습니다.")
+
+    def change_pin(self):
+        dlg = TeamDialog("pin")
+
+        def handler(d):
+            ok, res = self.team_request(self.cfg["team"]["host"], "/api/team/profile",
+                                        {"pin": d.pin.text(), "old_pin": d.old_pin.text()})
+            return None if ok else res
+
+        dlg.handler = handler
+        if dlg.exec():
+            self.tray.notify("PIN 을 바꿨습니다.")
+
+    def leave_team(self):
+        if QMessageBox.question(None, APP_NAME, "이 PC 에서 팀 로그아웃할까요?\n(팀원 목록에서 지워지지는 않습니다. "
+                                "나중에 이름 + PIN 으로 다시 로그인할 수 있습니다.)") != QMessageBox.StandardButton.Yes:
+            return
+        self.cfg["team"] = dict(EMPTY_TEAM)
+        if self.cfg["space"] == TEAM or self.cfg["space"].startswith("m:"):
+            self.cfg["space"] = ME
+        self.apply_team_auth()
+        self.push_spaces()
+
+    # ------------------------------------------------------------ team (host)
+    def start_host(self, quiet=False):
+        if not self.share:
+            return
+        if not quiet:
+            if self.in_team() and QMessageBox.question(
+                    None, APP_NAME, "지금 들어가 있는 팀에서 로그아웃하고 이 PC 를 새 팀의 호스트로 만들까요?"
+            ) != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            host = TeamHost(TEAM_DIR, self.cfg["name"])
+        except OSError as e:
+            QMessageBox.warning(None, APP_NAME, f"팀 폴더를 만들 수 없습니다.\n{e}")
+            return
+        self.share.team = host
+        self.cfg["team_host"] = True
+        owner = next(m for m in host.members() if m["id"] == host.owner_id)
+        self.cfg["name"] = owner["name"]
+        self.set_session(f"127.0.0.1:{self.cfg['port']}",
+                         {"token": host.owner_token(), "id": host.owner_id, "secret": host.secret,
+                          "team": host.name, "name": owner["name"]})
+        if not quiet:
+            QMessageBox.information(
+                None, APP_NAME,
+                f"팀 호스트를 열었습니다.\n\n팀원에게 알려 줄 것:\n  호스트 주소  {self.share.ip}\n  참여 코드  {host.code}\n\n"
+                "팀원은 트레이 > 팀스페이스 > 팀 참여 에서 입력합니다.\n"
+                "이 PC 가 꺼져 있으면 공용 공간을 볼 수 없으니, 켜 두는 시간이 긴 PC 를 추천합니다.")
+
+    def stop_host(self):
+        if QMessageBox.question(None, APP_NAME, "팀 호스트를 끌까요?\n팀원들은 공용 공간을 볼 수 없게 됩니다.\n"
+                                f"(데이터는 {TEAM_DIR} 에 남아 있어서 다시 켜면 그대로 돌아옵니다.)"
+                                ) != QMessageBox.StandardButton.Yes:
+            return
+        if self.share:
+            self.share.team = None
+        self.cfg["team_host"] = False
+        self.cfg["team"] = dict(EMPTY_TEAM)
+        if self.cfg["space"] != ME:
+            self.cfg["space"] = ME
+        self.apply_team_auth()
+        self.push_spaces()
+
+    def rename(self):
+        name, ok = QInputDialog.getText(None, "내 이름", "팀원·동료에게 보이는 이름 (최대 20자)",
+                                        QLineEdit.EchoMode.Normal, self.cfg["name"])
+        name = clean_name(name) if ok else ""
+        if not name or name == self.cfg["name"]:
+            return
+        if self.in_team():
+            ok, res = self.team_request(self.cfg["team"]["host"], "/api/team/profile", {"name": name})
+            if not ok:
+                QMessageBox.warning(None, APP_NAME, res)
+                return
+            name = res.get("name", name)
+        self.cfg["name"] = name
+        self.apply_team_auth()
+        self.poll_team()
+        self.push_spaces()
+        self.tray.update()
+
+    # ------------------------------------------------------------ windows
+    def open_panels(self):
+        return {m: m in self.panels for m in ("note", "cal")}
+
+    def show_panel(self, mode):
+        self.win_cfg(mode)["open"] = True
+        win = self.panels.get(mode)
         if not win:
-            win = Overlay(self, key, self.server_of(key), 0, mode)
-            self.panels[(key, mode)] = win
+            win = Overlay(self, mode)
+            self.panels[mode] = win
         win.show()
         win.raise_()
-        self.push_open(key)
+        self.push_open()
         self.save_later()
         return win
 
-    def close_panel(self, key, mode, forget=True):
-        win = self.panels.pop((key, mode), None)
+    def close_panel(self, mode, forget=True):
+        win = self.panels.pop(mode, None)
         if forget:
-            self.panel_cfg(key, mode)["open"] = False
+            self.win_cfg(mode)["open"] = False
         if win:
             win.close()
             win.deleteLater()
-        self.push_open(key)
+        if mode == "note":
+            self.note_label = None
+        self.push_open()
         self.save_later()
 
-    def toggle_panel(self, key, mode):
-        if (key, mode) in self.panels:
-            self.close_panel(key, mode)
+    def toggle_panel(self, mode):
+        if mode in self.panels:
+            self.close_panel(mode)
         else:
-            self.show_panel(key, mode)
+            self.show_panel(mode)
 
-    def push_open(self, key):
-        opened = self.open_panels(key)
-        for win in (self.overlays.get(key), self.panels.get((key, "cal"))):
-            if win:
-                win.push_config(open=opened)
+    def push_open(self):
+        if self.nav:
+            self.nav.push_config(open=self.open_panels(), noteLabel=self.note_label)
 
-    def open_note(self, key, date):
+    def open_note(self, date):
         """달력에서 날짜 클릭 → 할일 창을 열고(이미 열려 있으면 그대로) 그 날짜로"""
-        win = self.panels.get((key, "note"))
+        win = self.panels.get("note")
         if win:
             win.show()
             win.raise_()
-            win.view.page().runJavaScript(f"window.App && App.showDate({json.dumps(date)})")
+            win.call("showDate", date)
         else:
-            self.panel_cfg(key, "note")["date"] = date
-            self.show_panel(key, "note")
+            self.win_cfg("note")["date"] = date
+            self.show_panel("note")
 
-    def note_date_changed(self, key, date):
-        cal = self.panels.get((key, "cal"))
+    def note_date_changed(self, date, title, is_today):
+        self.note_label = {"date": date, "title": title, "today": is_today}
+        if self.nav:
+            self.nav.push_config(noteLabel=self.note_label)
+        cal = self.panels.get("cal")
         if cal:
             cal.push_config(noteDate=date)
 
-    def ensure_overlay(self, key):
-        ov = self.overlays.get(key)
-        if not ov:
-            ov = Overlay(self, key, self.server_of(key), self.keys().index(key))
-            ov.status_changed.connect(self.on_status)
-            self.overlays[key] = ov
-        return ov
+    def step_note(self, step):
+        win = self.panels.get("note")
+        if win:
+            win.call("step", step)
 
-    def set_visible(self, key, visible):
-        self.overlay_cfg(key)["visible"] = visible
+    def set_visible(self, visible):
+        self.cfg["visible"] = visible
         if visible:
-            self.ensure_overlay(key).show()
+            if not self.nav:
+                self.nav = Overlay(self, "nav")
+            self.nav.show()
             for mode in ("note", "cal"):
-                if self.panel_cfg(key, mode).get("open"):
-                    self.show_panel(key, mode)
+                if self.win_cfg(mode).get("open"):
+                    self.show_panel(mode)
         else:
-            if key in self.overlays:
-                self.overlays[key].hide()
+            if self.nav:
+                self.nav.hide()
             for mode in ("note", "cal"):
-                self.close_panel(key, mode, forget=False)  # 다시 표시하면 열려 있던 창도 다시 연다
+                self.close_panel(mode, forget=False)  # 다시 표시하면 열려 있던 창도 다시 연다
 
     def start(self):
         self.tray.update()
         self.tray.start()
-        for key in self.keys():
-            if self.is_visible(key):
-                self.set_visible(key, True)
+        if self.cfg["visible"]:
+            self.set_visible(True)
+        self.team_timer.start()
+        self.poll_team()
         if not self.share:
             self.tray.notify(f"포트 {self.cfg['port']}이(가) 사용 중이라 내 노트를 공유할 수 없습니다.\n"
                              "예전 DoganiServer 가 켜져 있다면 종료하고 다시 실행하세요.")
         elif not self.cfg["todo_dir"]:
             QTimer.singleShot(500, self.browse_dir)
 
-    def on_status(self, key, status):
-        self.status[key] = status
-
-    # -- actions
+    # ------------------------------------------------------------ actions
     def browse_dir(self):
         path = QFileDialog.getExistingDirectory(
             None, "todo(데일리 노트) 폴더 선택  예) 선택폴더/2026.11/261102 월.md",
@@ -845,37 +1289,71 @@ class DoganiApp(QObject):
 
     def add_server(self):
         text, ok = QInputDialog.getText(
-            None, "다른 사람 노트 추가",
-            f"상대방 Dogani 주소를 입력하세요 (IP 또는 IP:포트, 기본 포트 {DEFAULT_PORT})\n"
-            "상대방 트레이 > 내 노트 공유 중 > 주소 클릭으로 복사할 수 있습니다.",
+            None, "주소로 노트 추가",
+            f"팀원이 아닌 사람의 Dogani 주소 (IP 또는 IP:포트, 기본 포트 {DEFAULT_PORT})\n"
+            "팀원은 팀에 들어오면 자동으로 목록에 나옵니다.",
             QLineEdit.EchoMode.Normal, "")
         addr = normalize_server(text) if ok else ""
-        if not addr or addr == ME:
+        if not addr:
             return
         if addr not in self.cfg["servers"]:
             self.cfg["servers"].append(addr)
-        self.set_visible(addr, True)
+        self.cfg["space"] = addr
+        self.push_spaces()
 
     def remove_server(self, addr):
         if QMessageBox.question(None, APP_NAME, f"{addr} 노트를 목록에서 삭제할까요?") != QMessageBox.StandardButton.Yes:
             return
         if addr in self.cfg["servers"]:
             self.cfg["servers"].remove(addr)
-        for mode in ("note", "cal"):
-            self.close_panel(addr, mode)
-        self.cfg["overlays"].pop(addr, None)
         self.status.pop(addr, None)
         self.names.pop(addr, None)
-        ov = self.overlays.pop(addr, None)
-        if ov:
-            ov.close()
-            ov.deleteLater()
+        if self.cfg["space"] == addr:
+            self.cfg["space"] = ME
+        self.push_spaces()
 
     def on_command(self, name, arg):
         cfg = self.cfg
         share = self.share
+        team = share.team if share else None
         if name == "toggle_visible":
-            self.set_visible(arg, not self.is_visible(arg))
+            self.set_visible(not cfg["visible"])
+        elif name == "select_space":
+            if not cfg["visible"]:
+                self.set_visible(True)
+            self.select_space(arg)
+        elif name == "rename":
+            self.rename()
+        elif name in ("join_team", "login_team"):
+            self.join_team("join" if name == "join_team" else "login")
+        elif name == "change_pin":
+            self.change_pin()
+        elif name == "leave_team":
+            self.leave_team()
+        elif name == "start_host":
+            self.start_host()
+        elif name == "stop_host":
+            self.stop_host()
+        elif name == "copy_code" and team:
+            QGuiApplication.clipboard().setText(team.code)
+        elif name == "renew_code" and team:
+            team.renew_code()
+            self.tray.notify(f"새 참여 코드: {team.code}\n(이미 들어온 팀원에게는 영향 없음)")
+        elif name == "rename_team" and team:
+            text, ok = QInputDialog.getText(None, "팀 이름", "공용 공간 이름", QLineEdit.EchoMode.Normal, team.name)
+            if ok and clean_name(text):
+                team.rename_team(text)
+                self.poll_team()
+        elif name == "open_team_dir" and team:
+            os.startfile(team.notes_dir)
+        elif name == "reset_pin" and team:
+            team.reset_pin(arg)
+            self.tray.notify(f"PIN 을 초기화했습니다. 그 사람은 참여 코드({team.code}) + 같은 이름 + 새 PIN 으로 다시 참여하면 됩니다.")
+        elif name == "kick" and team:
+            m = next((m for m in team.members() if m["id"] == arg), None)
+            if m and QMessageBox.question(None, APP_NAME, f"{m['name']} 님을 팀에서 내보낼까요?") == QMessageBox.StandardButton.Yes:
+                team.kick(arg)
+                self.poll_team()
         elif name == "add_server":
             self.add_server()
         elif name == "remove_server":
@@ -886,6 +1364,9 @@ class DoganiApp(QObject):
             share.set_paused(not share.paused)
             cfg["paused"] = share.paused
             self.tray.update()
+        elif name == "toggle_team_only":
+            cfg["team_only"] = not cfg["team_only"]
+            self.apply_team_auth()
         elif name in ("block", "unblock") and share:
             (share.hub.block if name == "block" else share.hub.unblock)(arg)
             cfg["blocked"] = sorted(share.hub.snapshot()[1])
@@ -930,13 +1411,14 @@ def main():
     parser.add_argument("--dir", help="내 todo(데일리 노트) 폴더 경로")
     parser.add_argument("--port", type=int, help=f"내 노트 공유 포트 (기본 {DEFAULT_PORT})")
     parser.add_argument("--add", metavar="ADDR", action="append", help="다른 사람 주소 추가 (IP 또는 IP:포트)")
+    parser.add_argument("--name", help="내 이름")
     args = parser.parse_args()
 
     register_ui_scheme()
     qapp = QApplication(sys.argv)
     qapp.setQuitOnLastWindowClosed(False)
 
-    mutex = single_instance()
+    mutex = liveupdate.MUTEX = single_instance()
     if mutex is None:
         QMessageBox.information(None, APP_NAME, "Dogani 가 이미 실행 중입니다.\n시스템 트레이를 확인하세요.")
         return
@@ -946,6 +1428,8 @@ def main():
         cfg["todo_dir"] = os.path.abspath(args.dir)
     if args.port:
         cfg["port"] = args.port
+    if args.name and clean_name(args.name):
+        cfg["name"] = clean_name(args.name)
     for addr in args.add or []:
         addr = normalize_server(addr)
         if addr and addr not in cfg["servers"]:

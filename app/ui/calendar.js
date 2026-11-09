@@ -43,7 +43,9 @@
       let d = ev.start;
       for (let k = 0; d <= ev.end && k < 366; k++, d = addDays(d, 1)) {
         (byDate[d] = byDate[d] || []).push(ev);
-        if (ev.holiday) off.add(d);
+        // 시작/끝 미정 일정의 페이드용 하루는 쉬는 날로 치지 않음
+        const fake = (ev.open === "start" && d === ev.start) || (ev.open === "end" && d === ev.end);
+        if (ev.holiday && !fake) off.add(d);
       }
     }
     return { byDate, off };
@@ -60,38 +62,48 @@
   }
 
   function eventTip(ev) {
-    const range = ev.start === ev.end ? ev.start : `${ev.start} ~ ${ev.end}`;
+    const range = ev.open === "start" ? `~ ${ev.end} (시작 미정)`
+      : ev.open === "end" ? `${ev.start} ~ (끝 미정)`
+      : ev.start === ev.end ? ev.start : `${ev.start} ~ ${ev.end}`;
     return [
       `${ev.title}${ev.holiday ? " (쉬는 날)" : ""}`,
-      `${range}${ev.time ? " " + ev.time : ""}`,
+      `${range}${ev.time ? " " + timeText(ev) : ""}${ev.uncertain ? " (정확한 시각 미정)" : ""}`,
       ev.place && `장소: ${ev.place}`,
       ev.tags && ev.tags.length && ev.tags.map((t) => "#" + t).join(" "),
       ev.memo && `메모: ${ev.memo}`,
     ].filter(Boolean).join("\n");
   }
 
-  const shortTime = (t) => (t || "").split("-")[0];
-  const evAttrs = (ev, cls) => `class="${cls.join(" ")}" style="--ev:${eventColor(ev)}" title="${esc(eventTip(ev))}"`;
+  const q = (ev) => (ev.uncertain ? "쯤" : "");  // TODO 로캘: 영어면 "~10:00" 등
+  const timeText = (ev) => (ev.time || "") + q(ev);
+  const shortTime = (ev) => (ev.time || "").split("-")[0] + q(ev);
+  // 공용 일정(ev.team)은 점선 테두리 + 툴팁에 [공용] 표시
+  const evAttrs = (ev, cls) => `class="${cls.concat(ev.team ? ["team"] : []).join(" ")}" style="--ev:${eventColor(ev)}" ` +
+    `title="${esc((ev.team ? "[공용] " : "") + eventTip(ev))}"`;
 
   /** 노트 위 일정 줄용 칩 (시간·장소까지) */
   function chip(ev) {
     const cls = ["ev"];
     if (ev.important) cls.push("important");
     if (ev.holiday) cls.push("holiday");
-    const time = ev.time ? `<span class="ev-time">${esc(ev.time)}</span>` : "";
+    if (ev.uncertain) cls.push("unsure");
+    const time = ev.time ? `<span class="ev-time">${esc(timeText(ev))}</span>` : "";
     const place = ev.place ? `<span class="ev-place">@${esc(ev.place)}</span>` : "";
     return `<span ${evAttrs(ev, cls)}>${time}${esc(ev.title)}${place}</span>`;
   }
 
   /** 달력 칸 하루짜리 일정: 굵게 아니고 시간 있으면 "● 15:00 제목", 아니면 칩 */
   function dayItem(ev) {
-    const time = ev.time ? `<span class="ev-time">${esc(shortTime(ev.time))}</span>` : "";
+    const time = ev.time ? `<span class="ev-time">${esc(shortTime(ev))}</span>` : "";
     if (ev.time && !ev.important && !ev.holiday) {
-      return `<span ${evAttrs(ev, ["ev", "ev-dot"])}><i></i>${time}${esc(ev.title)}</span>`;
+      const cls = ["ev", "ev-dot"];
+      if (ev.uncertain) cls.push("unsure");  // ○ 속 빈 점 + 옅은 글씨
+      return `<span ${evAttrs(ev, cls)}><i></i>${time}${esc(ev.title)}</span>`;
     }
     const cls = ["ev"];
     if (ev.important) cls.push("important");
     if (ev.holiday) cls.push("holiday");
+    if (ev.uncertain) cls.push("unsure");
     return `<span ${evAttrs(ev, cls)}>${time}${esc(ev.title)}</span>`;
   }
 
@@ -106,12 +118,16 @@
     if (ev.holiday) cls.push("holiday");
     if (head) cls.push("head");
     if (tail) cls.push("tail");
+    // 시작/끝 미정: 그 끝 쪽 첫 칸에서 서서히 들어오거나(fade-in) 사라짐(fade-out)
+    const fadeIn = ev.open === "start" && head, fadeOut = ev.open === "end" && tail;
+    if (fadeIn) cls.push("fade-in");
+    if (fadeOut) cls.push("fade-out");
     const cut = (head ? 5 : 0) + (tail ? 5 : 0);
-    const style = `width:calc(${n} * 100% + ${n - 1} * var(--cal-gap) - ${cut}px)`;
+    const style = `width:calc(${n} * 100% + ${n - 1} * var(--cal-gap) - ${cut}px);--n:${n}`;
     let label = `<span class="bar-label">${esc(ev.title)}</span>`;
     if (ev.italic) {
-      label = (head ? '<i class="ah l"></i>' : "") + '<i class="ln"></i>' + label +
-        '<i class="ln"></i>' + (tail ? '<i class="ah r"></i>' : "");
+      label = (head && !fadeIn ? '<i class="ah l"></i>' : "") + '<i class="ln"></i>' + label +
+        '<i class="ln"></i>' + (tail && !fadeOut ? '<i class="ah r"></i>' : "");
     }
     return `<span ${evAttrs(ev, cls).replace('style="', `style="${style};`)}>${label}</span>`;
   }
