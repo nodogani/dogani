@@ -471,7 +471,7 @@ class Handler(BaseHTTPRequestHandler):
                 res = team.join(ctx.ip, body.get("code"), body.get("name"), body.get("pin"))
             else:
                 res = team.login(ctx.ip, body.get("name"), body.get("pin"))
-            res.update(secret=team.secret, team=team.name)
+            res.update(pub=team.pub, team=team.name)
             return self._send_json(res)
         if path == "/hello":   # 참여 전에 주소가 맞는지 확인용
             return self._send_json({"app": "Dogani", "team": team.name, "host": self.share.name})
@@ -479,13 +479,13 @@ class Handler(BaseHTTPRequestHandler):
         if not mid:
             return self._send_json({"error": "not_member", "message": "팀원만 볼 수 있습니다."}, 401)
         if path == "/me":
-            # 팀원 PC 가 주기적으로 보내는 신호: 내 노트 주소를 알리고 팀원 목록·비밀키를 받는다
+            # 팀원 PC 가 주기적으로 보내는 신호: 내 노트 주소를 알리고 팀원 목록·공개키를 받는다
             port = int(qs.get("port", ["0"])[0] or 0)
             ip = self.share.ip if ctx.owner else ctx.ip
             team.touch(mid, f"{ip}:{port}" if port else "")
             members = team.members()
             me = next((m for m in members if m["id"] == mid), None)
-            return self._send_json({"me": me, "members": members, "secret": team.secret, "team": team.name})
+            return self._send_json({"me": me, "members": members, "pub": team.pub, "team": team.name})
         if path == "/profile" and method == "POST":
             body = self._body()
             name = team.update_profile(mid, body.get("name"), body.get("pin"), body.get("old_pin"))

@@ -51,7 +51,7 @@
 `name, todo_dir, port(8765), servers[], visible, mode, space, date, pos, panel, windows, on_top, opacity, theme, paused, blocked[], team, team_host, team_only`
 
 ### 3.4 팀 호스트 데이터 `%APPDATA%\Dogani\team\`
-- `team.json`: `name, secret(hex32), code(참여 코드 6자리), members{id: name, PIN 해시, 마지막 신호, 주소}`
+- `team.json`: `name, sign_key(Ed25519 개인키 hex32, 호스트 밖으로 안 나감), code(참여 코드 6자리), members{id: name, PIN 해시, 마지막 신호, 주소}`
 - `notes/`: 공용 노트(3.1 과 같은 형식) + `일정.md`(처음에 예시로 생성)
 
 ## 4. HTTP API
@@ -70,8 +70,8 @@
 | `/api/schedule` | GET | 파싱된 일정 목록 |
 | `/api/sched-doc` | GET/POST | 일정 파일 원문 / 저장 |
 | `/api/team/hello` | GET | 호스트 확인 (인증 전) |
-| `/api/team/join` | POST | `{code, name, pin}` → 토큰·비밀키 |
-| `/api/team/login` | POST | `{name, pin}` → 토큰·비밀키 (5회 실패 시 IP 1분 잠금) |
+| `/api/team/join` | POST | `{code, name, pin}` → 토큰·공개키(`pub`) |
+| `/api/team/login` | POST | `{name, pin}` → 토큰·공개키(`pub`) (5회 실패 시 IP 1분 잠금) |
 | `/api/team/me?port=` | GET | 팀원 신호(20초 주기, 75초 안 = 접속 중) + 팀원 목록·비밀키 |
 | `/api/team/profile` | POST | 이름·PIN 변경 |
 | `/api/team/{info,events,note,month,schedule,sched-doc}` | | 개인 공간과 같은 형식, 팀원만 |
@@ -84,7 +84,9 @@
 
 - 개인 노트는 기본적으로 사내망 누구나 읽기 가능 (암호 없음). 차단·일시 중지·팀원 전용으로 제한
 - PIN: 숫자 4~8자리, 솔트 + PBKDF2(120,000회)
-- 토큰: `팀원ID.발급시각.HMAC(팀 비밀키)`. 팀원 PC 도 비밀키로 직접 검증 → 호스트가 꺼져도 팀원 전용 공유 동작 (팀원끼리 신뢰 전제)
+- 토큰: `팀원ID.발급시각.Ed25519서명(hex)`. 호스트만 개인키로 서명, 팀원 PC 는 `/api/team/me` 로 받은 공개키·팀원 목록(`min_iat` 포함)으로 직접 검증 → 호스트가 꺼져도 팀원 전용 공유 동작, 공개키로는 위조 불가
+- 내보내기 = 목록에서 삭제, PIN 초기화 = `min_iat` 올림. 각 PC 는 다음 `/me` 폴링(20초) 때 반영. 남은 팀원 토큰은 그대로 유효(키 교체 없음)
+- 예전 HMAC `secret` 은 로드 시 삭제 → 예전 토큰 전부 무효, 팀원은 이름 + PIN 으로 1회 재로그인
 - 업데이트: GitHub `nodogani/dogani` 의 태그 zip(HTTPS)만 받음. 서명 확인 없음 (저장소 쓰기 권한 = 배포 권한)
 
 ## 6. 배포·업데이트

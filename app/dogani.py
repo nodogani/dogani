@@ -57,7 +57,7 @@ STATUS_LABELS = {
 }
 TEAM_STATUS = {"online": "연결됨", "offline": "호스트 연결 끊김", "logged_out": "다시 로그인 필요"}
 
-EMPTY_TEAM = {"host": "", "token": "", "id": "", "secret": "", "team": "", "members": []}
+EMPTY_TEAM = {"host": "", "token": "", "id": "", "pub": "", "team": "", "members": []}
 DEFAULT_CONFIG = {
     "port": DEFAULT_PORT,
     "todo_dir": "",
@@ -93,6 +93,7 @@ def load_config():
         saved = migrate_old_config()
     cfg.update(saved)
     cfg["team"] = {**EMPTY_TEAM, **(cfg.get("team") or {})}
+    cfg["team"].pop("secret", None)   # 예전 HMAC 비밀키 (위조에 쓰일 수 있어 폐기)
     migrate_windows(cfg)
     if not cfg["name"]:
         cfg["name"] = clean_name(os.environ.get("USERNAME") or socket.gethostname())
@@ -1018,7 +1019,7 @@ class DoganiApp(QObject):
     def apply_team_auth(self):
         if self.share:
             t = self.cfg["team"]
-            self.share.auth.update(t.get("secret") if t.get("token") else "", t.get("members"))
+            self.share.auth.update(t.get("pub") if t.get("token") else "", t.get("members"), joined=bool(t.get("token")))
             self.share.team_only = self.cfg["team_only"]
             self.share.name = self.cfg["name"]
 
@@ -1045,7 +1046,7 @@ class DoganiApp(QObject):
         if status == 200:
             self.team_status = "online"
             t["members"] = res.get("members") or []
-            t["secret"] = res.get("secret") or t["secret"]
+            t["pub"] = res.get("pub") or t.get("pub", "")
             t["team"] = res.get("team") or t["team"]
             me = res.get("me")
             if me and me.get("name") and me["name"] != self.cfg["name"]:
@@ -1073,7 +1074,7 @@ class DoganiApp(QObject):
 
     def set_session(self, host, res):
         self.cfg["team"] = {**EMPTY_TEAM, "host": host, "token": res["token"], "id": res["id"],
-                            "secret": res.get("secret", ""), "team": res.get("team", "")}
+                            "pub": res.get("pub", ""), "team": res.get("team", "")}
         self.cfg["name"] = res.get("name") or self.cfg["name"]
         self.team_status = "online"
         self.apply_team_auth()
@@ -1144,7 +1145,7 @@ class DoganiApp(QObject):
         owner = next(m for m in host.members() if m["id"] == host.owner_id)
         self.cfg["name"] = owner["name"]
         self.set_session(f"127.0.0.1:{self.cfg['port']}",
-                         {"token": host.owner_token(), "id": host.owner_id, "secret": host.secret,
+                         {"token": host.owner_token(), "id": host.owner_id, "pub": host.pub,
                           "team": host.name, "name": owner["name"]})
         if not quiet:
             QMessageBox.information(

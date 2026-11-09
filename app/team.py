@@ -8,8 +8,10 @@
   * 팀 참여 = 호스트 주소 + 참여 코드(6자리, 호스트 트레이에 표시) + 이름 + PIN(숫자 4~8자리)
   * 한 번 참여하면 PC 에 토큰을 저장해서 다시 묻지 않음. 다른 PC 에서는 이름 + PIN 으로 로그인
   * PIN 은 솔트+PBKDF2 해시로만 저장, 5번 틀리면 그 IP 는 1분 동안 로그인 금지
-  * 토큰 = 팀원ID.발급시각.HMAC(팀 비밀키). 팀원 PC 들은 비밀키로 토큰을 직접 검증해서
-    호스트가 꺼져 있어도 "팀원에게만 공유" 가 동작한다 (팀원끼리는 신뢰한다는 전제)
+  * 토큰 = 팀원ID.발급시각.Ed25519 서명. 서명 키(개인키)는 호스트 PC 에만 있고, 팀원 PC 들은
+    공개키만 받아서 토큰을 직접 검증한다 → 호스트가 꺼져 있어도 "팀원에게만 공유" 가 동작하고,
+    팀원(또는 내보낸 사람)이 공개키로 토큰을 위조할 수는 없다
+  * 내보내기 = 팀원 목록에서 삭제, PIN 초기화 = min_iat 올림. 둘 다 팀원 목록과 함께 각 PC 로 전파
 """
 import datetime as dt
 import hashlib
@@ -19,6 +21,9 @@ import os
 import secrets
 import threading
 import time
+from functools import lru_cache
+
+import ed25519
 
 PIN_ITER = 120_000
 FAIL_LIMIT = 5
@@ -36,56 +41,64 @@ SCHEDULE_SEED = """# 공용 일정
 
 
 # ---------------------------------------------------------------- token
-def sign(secret_hex, mid, iat):
-    msg = f"{mid}.{iat}".encode()
-    return hmac.new(bytes.fromhex(secret_hex), msg, hashlib.sha256).hexdigest()[:32]
+def public_key(sign_key_hex):
+    return ed25519.public_key(bytes.fromhex(sign_key_hex)).hex()
 
 
-def make_token(secret_hex, mid, iat=None):
+def make_token(sign_key_hex, mid, iat=None):
     iat = int(iat if iat is not None else time.time())
-    return f"{mid}.{iat}.{sign(secret_hex, mid, iat)}"
+    return f"{mid}.{iat}.{ed25519.sign(bytes.fromhex(sign_key_hex), f'{mid}.{iat}'.encode()).hex()}"
 
 
-def parse_token(secret_hex, token):
+def _shape_ok(token, members=None):
+    """비싼 서명 검증 전에 싼 검사: 형식·서명 길이·팀원 목록에 있는 ID 인지 (아무 토큰으로 CPU 를 태우지 못하게)"""
+    parts = (token or "").split(".")
+    return len(parts) == 3 and len(parts[2]) == 128 and (not members or parts[0] in members)
+
+
+@lru_cache(maxsize=256)   # 같은 토큰이 요청마다 오므로 서명 검증은 한 번만
+def parse_token(pub_hex, token):
     """서명이 맞으면 (팀원ID, 발급시각), 아니면 None"""
     try:
         mid, iat, sig = (token or "").split(".")
         iat = int(iat)
+        ok = ed25519.verify(bytes.fromhex(pub_hex), f"{mid}.{iat}".encode(), bytes.fromhex(sig))
     except ValueError:
         return None
-    if not secret_hex or not hmac.compare_digest(sign(secret_hex, mid, iat), sig):
-        return None
-    return mid, iat
+    return (mid, iat) if ok else None
 
 
 class TeamAuth:
-    """팀원 PC(호스트 아님)에서 접속자 토큰 검증용. 비밀키·팀원 목록은 호스트에서 받아 온다."""
+    """팀원 PC(호스트 아님)에서 접속자 토큰 검증용. 공개키·팀원 목록은 호스트에서 받아 온다."""
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.secret = ""
-        self.members = {}   # id -> name (모르면 빈 dict = 목록 확인 안 함)
+        self.pub = ""
+        self.joined = False
+        self.members = {}   # id -> (이름, min_iat) (모르면 빈 dict = 목록 확인 안 함)
 
-    def update(self, secret, members):
+    def update(self, pub, members, joined=None):
         with self.lock:
-            self.secret = secret or ""
-            self.members = {m["id"]: m["name"] for m in members or []}
+            self.pub = pub or ""
+            # 팀에 들어 있는데 공개키가 아직 없으면(업데이트 직후·로그인 풀림) 아무 토큰도 통과 못 함 = 닫힌 쪽
+            self.joined = bool(pub) if joined is None else bool(joined)
+            self.members = {m["id"]: (m["name"], m.get("min_iat", 0)) for m in members or []}
 
     @property
     def active(self):
-        return bool(self.secret)
+        return self.joined
 
     def verify(self, token):
-        """토큰 → (id, 이름) 또는 None. 팀에서 내보낸 사람(목록에 없음)은 거부"""
+        """토큰 → (id, 이름) 또는 None. 내보낸 사람(목록에 없음)·PIN 초기화 이전 토큰은 거부"""
         with self.lock:
-            secret, members = self.secret, dict(self.members)
-        parsed = parse_token(secret, token)
+            pub, members = self.pub, dict(self.members)
+        parsed = parse_token(pub, token) if pub and _shape_ok(token, members) else None
         if not parsed:
             return None
-        mid = parsed[0]
-        if members and mid not in members:
+        mid, iat = parsed
+        if members and (mid not in members or iat < members[mid][1]):
             return None
-        return mid, members.get(mid, "")
+        return mid, members.get(mid, ("", 0))[0]
 
 
 # ---------------------------------------------------------------- pin
@@ -130,6 +143,9 @@ class TeamHost:
         self.notes_dir = os.path.join(folder, "notes")
         os.makedirs(self.notes_dir, exist_ok=True)
         self.data = self._load()
+        if self.data.pop("_dirty", False):   # 새 서명 키는 바로 저장 (안 그러면 재시작마다 키가 바뀜)
+            self._save()
+        self.pub = public_key(self.data["sign_key"])
         self.fails = {}   # ip -> [횟수, 잠금 해제 시각]
         seed = os.path.join(self.notes_dir, "일정.md")
         if not os.path.exists(seed):
@@ -150,7 +166,12 @@ class TeamHost:
         except (OSError, ValueError):
             data = {}
         data.setdefault("name", "팀 공용")
-        data.setdefault("secret", secrets.token_hex(32))
+        # 예전 HMAC 비밀키는 팀원 PC 에 퍼져 있어서 위조에 쓰일 수 있음 → 버리고 서명 키로 교체
+        # (예전 토큰은 모두 무효, 팀원은 이름 + PIN 으로 한 번 다시 로그인)
+        if "secret" in data or "sign_key" not in data:
+            data.pop("secret", None)
+            data.setdefault("sign_key", secrets.token_hex(32))
+            data["_dirty"] = True
         data.setdefault("code", self._new_code())
         data.setdefault("members", {})
         return data
@@ -166,10 +187,6 @@ class TeamHost:
         return f"{secrets.randbelow(1_000_000):06d}"
 
     # -- properties
-    @property
-    def secret(self):
-        return self.data["secret"]
-
     @property
     def code(self):
         return self.data["code"]
@@ -216,7 +233,7 @@ class TeamHost:
             return mid
 
     def owner_token(self):
-        return make_token(self.secret, self.owner_id)
+        return make_token(self.data["sign_key"], self.owner_id)
 
     def _limit(self, ip):
         f = self.fails.get(ip)
@@ -271,12 +288,16 @@ class TeamHost:
         return self._session(mid)
 
     def _session(self, mid):
-        token = make_token(self.secret, mid)
+        token = make_token(self.data["sign_key"], mid)
         return {"token": token, "id": mid, "name": self.data["members"][mid]["name"]}
 
     def member(self, token):
         """토큰 → 팀원 id (내보냈거나 PIN 초기화 이전 토큰이면 None)"""
-        parsed = parse_token(self.secret, token)
+        with self.lock:
+            known = set(self.data["members"])
+        if not _shape_ok(token, known):
+            return None
+        parsed = parse_token(self.pub, token)
         if not parsed:
             return None
         mid, iat = parsed
@@ -337,6 +358,7 @@ class TeamHost:
         now = time.time()
         with self.lock:
             out = [{"id": mid, "name": m["name"], "addr": m.get("addr", ""), "admin": bool(m.get("admin")),
+                    "min_iat": m.get("min_iat", 0),
                     "online": now - m.get("last_seen", 0) < ONLINE_WINDOW or bool(m.get("admin")),
                     "pending": not m.get("pin") and not m.get("admin"),
                     "last_seen": m.get("last_seen", 0)}
