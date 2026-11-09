@@ -56,6 +56,43 @@
         </div>
         <div id="cal-grid" class="cal-grid"></div>
         <footer class="view-footer" id="cal-footer"></footer>
+        <form id="ev-add" class="ev-add" hidden autocomplete="off">
+          <div class="seg" id="ev-add-seg">
+            <button type="button" data-kind="event" title="하는 일: 회의·실사·발표 등 (여러 날이면 띠로 표시)">일정</button>
+            <button type="button" data-kind="span" title="이어지는 상태: 출장·교육·연차·마감까지 등 (화살표로 표시)">기간</button>
+          </div>
+          <input type="text" id="ev-add-name" class="ev-add-name" placeholder="제목" required>
+          <div class="ev-add-opts">
+            <label><input type="checkbox" id="ev-add-bold">중요</label>
+            <label title="정확한 시각 모름, 그 사이 언젠가"><input type="checkbox" id="ev-add-about">애매함</label>
+            <label><input type="checkbox" id="ev-add-off">쉬는 날</label>
+          </div>
+          <div class="ev-add-grid">
+            <span class="k">날짜</span>
+            <div class="v">
+              <input type="date" id="ev-add-start"><span class="sep">-</span><input type="date" id="ev-add-end">
+            </div>
+            <span class="k">시간</span>
+            <div class="v">
+              <select id="ev-add-t1"></select><span class="sep">-</span><select id="ev-add-t2"></select>
+            </div>
+            <span class="k">태그</span>
+            <div class="v"><input type="text" id="ev-add-tags" placeholder="쉼표로 구분  예) 과제, 교육"></div>
+            <span class="k">장소</span>
+            <div class="v"><input type="text" id="ev-add-place"></div>
+            <span class="k" id="ev-add-memo-k" hidden>메모</span>
+            <div class="v" id="ev-add-memo-row" hidden><input type="text" id="ev-add-memo"></div>
+          </div>
+          <div class="ev-add-hint" id="ev-add-hint"></div>
+          <div class="ev-add-err" id="ev-add-err"></div>
+          <div class="ev-add-btns">
+            <button type="button" class="text-btn" id="ev-add-memo-btn">+ 메모</button>
+            <button type="button" class="text-btn danger" id="ev-add-del" hidden>삭제</button>
+            <span class="grow"></span>
+            <button type="button" class="text-btn" id="ev-add-cancel">취소</button>
+            <button type="submit" class="text-btn active" id="ev-add-ok">추가</button>
+          </div>
+        </form>
       </div>
 
       <!-- 달력 창 > 일정 편집 -->

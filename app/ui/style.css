@@ -427,12 +427,16 @@ body.writable .cm-table-widget { cursor: text; }
   border: 1px solid transparent;
 }
 .cal-day:hover { background: var(--bg-hover); }
+.cal-day { position: relative; }
 .cal-day.other { opacity: .35; }
 .cal-day.today { border-color: var(--accent); }
 .cal-day.selected { background: var(--bg-hover); }
 .cal-day .num { font-size: 12px; font-weight: 600; }
 .cal-day .count {
-  align-self: flex-end;
+  /* 숫자 줄 오른쪽에 띄움: 칸 아래 한 줄을 차지하면 노트 있는 칸만 일정 영역이 짧아져 기간 띠 줄이 옆 칸과 어긋남 */
+  position: absolute;
+  top: 4px;
+  right: 4px;
   max-width: 100%;
   overflow: hidden;
   text-overflow: clip;
@@ -475,7 +479,16 @@ body.writable .cm-table-widget { cursor: text; }
   gap: 1px;
   margin: 2px -5px;  /* 칸 테두리까지 넓혀서 기간 일정이 옆 칸과 이어지게 */
 }
+.cal-day .singles, .cal-day .lanes { display: flex; flex-direction: column; gap: 1px; }
+.cal-day .singles { flex: 1 1 0; min-height: 0; overflow: hidden; }  /* 남는 자리만, 넘치면 +N */
+.cal-day .lanes { flex: none; margin-top: auto; }  /* 기간 띠: 칸 아래 고정 */
 .cal-day .ev { margin: 0 5px; }
+/* 숨은 일정 수: 날짜 숫자 오른쪽 강조 배지 */
+.cal-day > .ev.ev-more {
+  position: absolute; top: 4px; left: 24px; margin: 0; padding: 0 5px;
+  line-height: 16px; font-size: 11px; font-weight: 700; border-radius: 8px;
+  background: var(--accent); color: #fff; overflow: visible;
+}
 .ev {
   display: block;
   min-width: 0;
@@ -536,6 +549,11 @@ body.writable .cm-table-widget { cursor: text; }
 .ev.arrow.fade-out .ln:last-child { background: linear-gradient(270deg, transparent, var(--ev)); }
 .ev.arrow .bar-label { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .ev.arrow .bar-label::before { content: none !important; }
+/* 일정 마우스오버 = 클릭(수정)·드래그(옮기기) 가능 표시 */
+body.writable .cal-grid .ev[data-k]:not(.team) { cursor: grab; }
+body.writable .cal-grid .ev[data-k]:not(.team):hover { filter: brightness(1.25); outline: 1px solid var(--ev); outline-offset: -1px; }
+body.writable .cal-grid .ev.arrow[data-k]:hover { outline: none; background: color-mix(in srgb, var(--ev) 15%, transparent); }
+.cal-day .ev.moving { opacity: .4; }
 .ev.ev-more { background: none; color: var(--text-muted); padding: 0 2px; font-weight: 600; }
 .ev[hidden] { display: none; }
 /* 시간 있는 하루 일정 (굵게 아님): ● 15:00 제목 */
@@ -685,3 +703,56 @@ body.mode-nav #root { gap: 4px; }
 /* 개인 공간 달력에 같이 그리는 공용 일정: 점선 테두리 */
 .ev.team { outline: 1px dashed color-mix(in srgb, var(--ev) 70%, transparent); outline-offset: -1px; }
 .cal-day .ev.bar.team { outline-offset: -1px; }
+
+/* ------------------------------------------------------------ 달력 우클릭·드래그: 일정 추가 팝업 */
+.ev-add {
+  position: fixed;
+  z-index: 50;
+  width: 264px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg);
+  backdrop-filter: blur(20px);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .28);
+}
+.ev-add[hidden] { display: none; }
+.seg { display: flex; padding: 2px; gap: 2px; background: var(--bg-hover); border-radius: 7px; }
+.seg button {
+  flex: 1; height: 24px; border: 0; border-radius: 5px; background: transparent;
+  color: var(--text-muted); font: inherit; font-weight: 600; cursor: pointer;
+}
+.seg button.on { background: var(--accent); color: #fff; }
+.ev-add input[type=text], .ev-add input[type=date], .ev-add select {
+  width: 100%; min-width: 0; height: 26px; padding: 0 6px; font: inherit;
+  color: var(--text); background: var(--bg-hover); border: 1px solid transparent; border-radius: 5px;
+}
+.ev-add select option { background: var(--bg); color: var(--text); }
+.ev-add input:focus, .ev-add select:focus { outline: none; border-color: var(--accent); }
+.ev-add input[type=date]::-webkit-calendar-picker-indicator { opacity: .5; cursor: pointer; }
+.ev-add .ev-add-name { height: 30px; font-size: 14px; font-weight: 600; }
+.ev-add-grid { display: grid; grid-template-columns: auto 1fr; gap: 5px 8px; align-items: center; }
+.ev-add-grid .k { color: var(--text-muted); }
+.ev-add-grid .v { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.ev-add-grid .sep { color: var(--text-muted); }
+.ev-add-hint { color: var(--accent); font-weight: 600; min-height: 15px; }
+.ev-add-opts { display: flex; flex-wrap: wrap; gap: 4px; }
+.ev-add-opts label {
+  display: flex; align-items: center; gap: 3px; padding: 2px 8px; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 999px; color: var(--text-muted);
+}
+.ev-add-opts label:has(input:checked) { border-color: var(--accent); color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.ev-add-opts input { display: none; }
+.ev-add-err { color: var(--sun); }
+.ev-add-err:empty { display: none; }
+.ev-add-btns { display: flex; justify-content: flex-end; gap: 6px; }
+.ev-add-btns .grow { flex: 1; }
+.ev-add-btns .text-btn[hidden], .ev-add-grid [hidden] { display: none; }
+.ev-add-btns .danger { color: var(--sun); }
+.cal-day.range-sel { background: color-mix(in srgb, var(--accent) 18%, transparent); user-select: none; }
+.cal-grid { user-select: none; }

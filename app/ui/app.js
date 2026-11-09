@@ -549,6 +549,10 @@
   $("cal-edit").addEventListener("click", () => setCalView("doc"));
   $("doc-back").addEventListener("click", () => doc.save().then(() => setCalView("month")));
   $("cal-grid").addEventListener("click", (e) => {
+    if (dragged) { dragged = false; return; }  // 드래그로 기간 고르거나 일정 옮긴 뒤의 click 은 무시
+    const ev = evOf(e.target.closest(".ev[data-k]"));
+    // 일정 클릭 = 수정 팝업 (공용 일정·읽기 전용이면 그냥 노트 열기)
+    if (ev && state.writable && !ev.team) { evAdd.open("", "", e.clientX, e.clientY, ev); return; }
     const cell = e.target.closest(".cal-day");
     if (!cell) return;
     state.noteDate = cell.dataset.date;
@@ -556,6 +560,268 @@
     cell.classList.add("selected");
     if (bridge) bridge.openNote(cell.dataset.date);
   });
+
+  // 달력 칸 우클릭·드래그: 일정 추가 팝업 → 일정 파일 끝에 한 줄 덧붙임
+  // 일정 = 하는 일: 시작 날짜 필수, 끝은 비우면 하루 (여러 날이면 띠)
+  // 기간 = 이어지는 상태: 화살표(*기울임*)로 저장, 시작·끝 중 한쪽 비우면 미정 (끝만 = 마감)
+  const TIMES = [];
+  for (let h = 7; h <= 22; h++) for (const m of ["00", "30"]) TIMES.push(`${h}:${m}`);
+  $("ev-add-t1").innerHTML = '<option value="">종일</option>' + TIMES.map((t) => `<option>${t}</option>`).join("");
+  $("ev-add-t2").innerHTML = '<option value="">-</option>' + TIMES.map((t) => `<option>${t}</option>`).join("");
+  const LIST_RE = /^(\s*(?:[-*+]|\d+[.)])\s+(?:\[.\]\s+)?)/;
+  const yymmdd = (v) => v.slice(2).replace(/-/g, "");
+  const cleanField = (v) => String(v || "").replace(/,/g, " ").trim();
+  /** 일정 dict → 파일 한 줄 (팝업 입력값과 같은 모양: kind, s, e, t1, t2, about, bold, off, title, tags[], place, memo) */
+  function schedLine(o) {
+    let date = o.s && o.e && o.s !== o.e ? `${yymmdd(o.s)}-${yymmdd(o.e)}` : o.s && o.e ? yymmdd(o.s) : o.s ? `${yymmdd(o.s)}-` : `-${yymmdd(o.e)}`;
+    if (o.off) date = `==${date}==`;
+    const mk = (o.bold ? "**" : "") + (o.kind === "span" ? "*" : "");
+    const time = o.t1 ? " " + o.t1 + (o.t2 ? "-" + o.t2 : "") + (o.about ? "?" : "") : "";
+    const parts = [mk + date + mk + time, cleanField(o.title)];
+    const tags = o.tags.map((t) => t.replace(/[#\s]/g, "")).filter(Boolean).map((t) => "#" + t);
+    if (tags.length) parts.push(tags.join(" "));
+    const place = cleanField(o.place), memo = cleanField(o.memo);
+    if (place || memo) parts.push(place);  // 장소 없이 메모만이면 "제목, , 메모"
+    if (memo) parts.push(memo);
+    return parts.join(", ");
+  }
+  /** 화면의 일정(ev) → schedLine 입력 모양 (시작/끝 미정은 그쪽을 비움) */
+  function evToObj(ev) {
+    const [t1, t2] = (ev.time || "").split("-");
+    return {
+      kind: ev.italic ? "span" : "event",
+      s: ev.open === "start" ? "" : ev.start, e: ev.open === "end" ? "" : ev.end,
+      t1: t1 || "", t2: t2 || "", about: !!ev.uncertain, bold: !!ev.important, off: !!ev.holiday,
+      title: ev.title, tags: ev.tags || [], place: ev.place || "", memo: ev.memo || "",
+    };
+  }
+  /** 일정 파일 고치기: fn(text) → 새 text. 충돌(409) 나면 다시 읽고 한 번 더 */
+  async function editSchedDoc(fn) {
+    for (let tries = 0; tries < 2; tries++) {
+      try {
+        const d = await api("/sched-doc");
+        if (d.no_dir) throw new Error("todo 폴더가 지정되지 않았습니다.");
+        await api("/sched-doc", { content: fn(d.exists ? d.content : ""), base_mtime: d.exists ? d.mtime : undefined });
+        await loadSchedule();
+        loadMonth();
+        return;
+      } catch (e) {
+        if (e.code === "conflict" && tries === 0) continue;  // 그 사이 파일이 바뀜
+        throw e;
+      }
+    }
+  }
+  /** ev 원래 줄(raw)을 새 줄로 바꿈 (null = 지움). 목록 기호(- [ ] 등)·들여쓰기는 그대로 둠 */
+  function replaceEvLine(ev, line) {
+    return editSchedDoc((text) => {
+      const lines = text.split("\n");
+      const i = lines.findIndex((l) => l.trim() === ev.raw);
+      if (i < 0) throw new Error("일정 파일에서 이 줄을 찾지 못했습니다 (다른 일정 파일에 있거나 그 사이 바뀜). '일정 편집'에서 고쳐 주세요.");
+      if (line === null) lines.splice(i, 1);
+      else {
+        const lead = lines[i].match(/^\s*/)[0], m = lines[i].trim().match(LIST_RE);
+        lines[i] = lead + (m ? m[1] : "") + line + (lines[i].endsWith("\r") ? "\r" : "");
+      }
+      return lines.join("\n");
+    });
+  }
+
+  const evAdd = {
+    kind: "event",
+    ev: null,  // 수정 중인 일정 (null = 새로 추가)
+    open(start, end, x, y, ev) {
+      if (!state.writable) return;
+      const f = $("ev-add");
+      f.reset();
+      this.ev = ev || null;
+      const o = ev ? evToObj(ev) : null;
+      $("ev-add-start").value = o ? o.s : start;
+      $("ev-add-end").value = o ? (o.e !== o.s ? o.e : "") : end > start ? end : "";
+      if (o) {
+        $("ev-add-name").value = o.title;
+        $("ev-add-bold").checked = o.bold;
+        $("ev-add-about").checked = o.about;
+        $("ev-add-off").checked = o.off;
+        for (const [id, t] of [["ev-add-t1", o.t1], ["ev-add-t2", o.t2]]) {
+          const sel = $(id);
+          if (t && ![...sel.options].some((op) => op.value === t)) sel.add(new Option(t, t));  // 7:15 같은 30분 단위 밖 시각
+          sel.value = t;
+        }
+        $("ev-add-tags").value = o.tags.join(", ");
+        $("ev-add-place").value = o.place;
+        $("ev-add-memo").value = o.memo;
+      }
+      const hasMemo = !!(o && o.memo);
+      $("ev-add-memo-row").hidden = $("ev-add-memo-k").hidden = !hasMemo;
+      $("ev-add-memo-btn").hidden = hasMemo;
+      $("ev-add-del").hidden = !ev;
+      $("ev-add-ok").textContent = ev ? "저장" : "추가";
+      $("ev-add-err").textContent = "";
+      this.setKind(o ? o.kind : "event");
+      f.hidden = false;
+      const w = f.offsetWidth, h = f.offsetHeight;
+      f.style.left = Math.max(4, Math.min(x, innerWidth - w - 4)) + "px";
+      f.style.top = Math.max(4, Math.min(y, innerHeight - h - 4)) + "px";
+      $("ev-add-name").focus();
+    },
+    close() { $("ev-add").hidden = true; this.ev = null; markRange(null); },
+    setKind(kind) {
+      this.kind = kind;
+      for (const b of $("ev-add-seg").children) b.classList.toggle("on", b.dataset.kind === kind);
+      $("ev-add-start").title = kind === "event" ? "시작 날짜" : "비우면 시작 미정 (마감만 있을 때)";
+      $("ev-add-end").title = kind === "event" ? "비우면 하루" : "비우면 끝 미정";
+      this.update();
+    },
+    /** [시작, 끝] — 일정은 끝을 비우면 하루, 기간은 비운 쪽이 미정("") */
+    range() {
+      let s = $("ev-add-start").value, e = $("ev-add-end").value;
+      if (s && e && e < s) [s, e] = [e, s];
+      if (this.kind === "event") return s ? [s, e || s] : ["", ""];
+      return [s, e];
+    },
+    /** 아래 미리 보기 문구 + 달력 선택 표시를 입력에 맞춰 갱신 */
+    update() {
+      const [s, e] = this.range();
+      const md = (v) => { const d = parseISO(v); return `${d.getMonth() + 1}/${d.getDate()}(${WD[d.getDay()]})`; };
+      const t1 = $("ev-add-t1").value, t2 = $("ev-add-t2").value, about = $("ev-add-about").checked;
+      $("ev-add-t2").disabled = !t1;
+      let date = "";
+      if (s && e && s !== e) date = `${md(s)} - ${md(e)}`;
+      else if (s && e) date = md(s);
+      else if (s) date = `${md(s)}부터 (끝 미정)`;
+      else if (e) date = `${md(e)}까지 (마감)`;
+      const time = !t1 ? "" : t2 ? ` ${t1}-${t2}` : ` ${t1}`;
+      const kind = this.kind === "span" ? "기간 →" : s && e && s !== e ? "일정 ▬" : "일정";
+      $("ev-add-hint").textContent = date ? `${kind} ${date}${time}${t1 && about ? " (애매함)" : ""}` : "";
+      markRange(s || e ? [s || e, e || s] : null);
+    },
+    values() {
+      const [s, e] = this.range();
+      return {
+        kind: this.kind, s, e,
+        t1: $("ev-add-t1").value, t2: $("ev-add-t2").value, about: $("ev-add-about").checked,
+        bold: $("ev-add-bold").checked, off: $("ev-add-off").checked,
+        title: $("ev-add-name").value, tags: $("ev-add-tags").value.split(/[,，]/),
+        place: $("ev-add-place").value, memo: $("ev-add-memo").value,
+      };
+    },
+    async submit() {
+      const [st, en] = this.range();
+      if (!st && !en) { $("ev-add-err").textContent = this.kind === "event" ? "시작 날짜를 고르세요" : "날짜를 하나 이상 고르세요"; return; }
+      const t1 = $("ev-add-t1").value, t2 = $("ev-add-t2").value;
+      if (t1 && t2 && timeMin(t2) <= timeMin(t1)) {
+        $("ev-add-err").textContent = "끝 시각이 시작보다 늦어야 합니다"; return;
+      }
+      if (!$("ev-add-name").value.trim()) return;
+      const line = schedLine(this.values());
+      try {
+        if (this.ev) await replaceEvLine(this.ev, line);
+        else await editSchedDoc((text) => (text && !text.endsWith("\n") ? text + "\n" : text) + line + "\n");
+        this.close();
+      } catch (e) {
+        $("ev-add-err").textContent = (this.ev ? "저장 실패: " : "추가 실패: ") + (e.message || e);
+      }
+    },
+    async remove() {
+      if (!this.ev || !confirm(`'${this.ev.title}' 일정을 지울까요?`)) return;
+      try {
+        await replaceEvLine(this.ev, null);
+        this.close();
+      } catch (e) {
+        $("ev-add-err").textContent = "삭제 실패: " + (e.message || e);
+      }
+    },
+  };
+  const timeMin = (t) => { const [h, m] = t.split(":").map(Number); return h * 60 + m; };
+  const evOf = (el) => {
+    const k = el && el.dataset.k;
+    return k && state.sched && state.sched.list ? state.sched.list[Number(k)] || null : null;
+  };
+  // 날짜 고르기: 칸을 드래그(왼쪽·오른쪽 버튼)해서 기간 선택, 우클릭만 하면 그 하루
+  // 일정 위에서 왼쪽 드래그 = 날짜 옮기기 (띠는 여러 칸에 걸쳐 있어서 칸은 마우스 위치로 찾음)
+  let drag = null, dragged = false, move = null;
+  function markRange(r) {
+    for (const c of $("cal-grid").querySelectorAll(".cal-day")) {
+      const d = c.dataset.date;
+      c.classList.toggle("range-sel", !!r && d >= r[0] && d <= r[1]);
+    }
+  }
+  function cellAt(x, y) {
+    for (const c of $("cal-grid").querySelectorAll(".cal-day")) {
+      const r = c.getBoundingClientRect();
+      if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return c;
+    }
+    return null;
+  }
+  const dayDiff = (a, b) => Math.round((parseISO(b) - parseISO(a)) / 86400000);
+  const sorted = (a, b) => (a <= b ? [a, b] : [b, a]);
+  $("cal-grid").addEventListener("mousedown", (e) => {
+    dragged = false;
+    const evEl = e.target.closest(".ev[data-k]");
+    const ev = evOf(evEl);
+    if (ev && e.button === 0) {
+      // 일정 위 왼쪽 버튼: 옮기기 준비 (그냥 떼면 click → 수정 팝업). 공용 일정·읽기 전용은 안 됨
+      const c = state.writable && !ev.team && cellAt(e.clientX, e.clientY);
+      if (c) move = { ev, el: evEl, from: c.dataset.date, to: c.dataset.date };
+      return;
+    }
+    const cell = e.target.closest(".cal-day");
+    if (!cell || (e.button !== 0 && e.button !== 2) || !state.writable) return;
+    drag = { from: cell.dataset.date, to: cell.dataset.date, button: e.button };
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (!move) return;
+    const c = cellAt(e.clientX, e.clientY);
+    if (!c || c.dataset.date === move.to) return;
+    move.to = c.dataset.date;
+    const n = dayDiff(move.from, move.to);
+    move.el.classList.toggle("moving", n !== 0);
+    markRange(n ? [CAL.addDays(move.ev.start, n), CAL.addDays(move.ev.end, n)] : null);
+  });
+  $("cal-grid").addEventListener("mouseover", (e) => {
+    const cell = drag && e.target.closest(".cal-day");
+    if (!cell || cell.dataset.date === drag.to) return;
+    drag.to = cell.dataset.date;
+    markRange(sorted(drag.from, drag.to));
+  });
+  document.addEventListener("mouseup", async (e) => {
+    if (move) {
+      const m = move, n = dayDiff(m.from, m.to);
+      move = null;
+      m.el.classList.remove("moving");
+      markRange(null);
+      if (!n) return;  // 제자리 = 클릭 (수정 팝업은 click 에서)
+      dragged = true;
+      const o = evToObj(m.ev);
+      if (o.s) o.s = CAL.addDays(o.s, n);
+      if (o.e) o.e = CAL.addDays(o.e, n);
+      try {
+        await replaceEvLine(m.ev, schedLine(o));
+      } catch (err) {
+        alert("옮기기 실패: " + (err.message || err));
+      }
+      return;
+    }
+    if (!drag) return;
+    const r = sorted(drag.from, drag.to), btn = drag.button;
+    drag = null;
+    if (r[0] === r[1] && btn === 0) return;  // 그냥 클릭 = 노트 열기
+    dragged = btn === 0;
+    markRange(r);
+    evAdd.open(r[0], r[1], e.clientX, e.clientY);
+  });
+  $("ev-add").addEventListener("submit", (e) => { e.preventDefault(); evAdd.submit(); });
+  $("ev-add").addEventListener("input", () => evAdd.update());
+  $("ev-add-seg").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) evAdd.setKind(b.dataset.kind); });
+  $("ev-add-cancel").addEventListener("click", () => evAdd.close());
+  $("ev-add-del").addEventListener("click", () => evAdd.remove());
+  $("ev-add-memo-btn").addEventListener("click", () => {
+    $("ev-add-memo-btn").hidden = true;
+    $("ev-add-memo-k").hidden = $("ev-add-memo-row").hidden = false;
+    $("ev-add-memo").focus();
+  });
+  $("ev-add").addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopPropagation(); evAdd.close(); } });
+  document.addEventListener("mousedown", (e) => { if (!$("ev-add").hidden && !e.target.closest("#ev-add")) evAdd.close(); });
 
   // 드래그 이동: 네비게이션 바, 창 위쪽 막대
   for (const el of [$("nav"), ...document.querySelectorAll(".panel-bar")]) {
@@ -581,10 +847,11 @@
   setInterval(checkDateRollover, 30 * 1000);
   setInterval(loadTeamSchedule, 60 * 1000);
   let fitTimer = null;
-  window.addEventListener("resize", () => {
+  // 창 크기뿐 아니라 숨어 있다 보일 때도(그릴 때 숨어 있으면 넘침 정리가 안 돼 띠가 겹침) 다시 맞춤
+  new ResizeObserver(() => {
     clearTimeout(fitTimer);
     fitTimer = setTimeout(() => { if (state.mode === "cal" && state.calView === "month") CAL.fitCells($("cal-grid")); }, 100);
-  });
+  }).observe($("cal-grid"));
 
   // ------------------------------------------------------------ init
   const sameSpace = (a, b) => a && b && a.key === b.key && a.server === b.server && a.prefix === b.prefix;

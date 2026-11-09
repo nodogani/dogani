@@ -13,7 +13,7 @@
   *기울임* = 기간을 화살표(←──→)로 표시
 - "10:00-10:30?" 처럼 시간 끝에 ? = 그 사이 언젠가 (정확한 시각 모름)
 - "-261119" = 시작 미정, 마감만 / "261119-" = 시작만, 끝 미정 (달력에서 페이드로 표시)
-- 태그는 #으로 시작하는 칸(여러 개 가능), 태그가 아닌 칸은 순서대로 장소, 메모
+- 태그는 #으로 시작하는 칸(여러 개 가능), 태그가 아닌 칸은 순서대로 장소, 메모 (장소 없이 메모만: "제목, , 메모")
 """
 import datetime as dt
 import re
@@ -58,6 +58,7 @@ def _add_month(d):
 
 def parse_line(line):
     """한 줄 → 일정 dict. 일정 줄이 아니면 None."""
+    raw = line.strip()  # 달력에서 수정할 때 파일에서 이 줄을 찾는 데 씀
     line = _LIST_RE.sub("", line.strip(), count=1)
     if not line:  # 제목·인용 등 날짜로 시작하지 않는 줄은 아래 정규식에서 걸러짐
         return None
@@ -97,8 +98,10 @@ def parse_line(line):
     for f in rest[1:]:
         if f.startswith("#"):
             tags += [t.lstrip("#") for t in f.split() if t.startswith("#") and len(t) > 1]
-        elif f:
-            others.append(f)
+        else:
+            others.append(f)  # 빈 칸도 자리로 셈: "제목, , 메모" = 장소 없이 메모
+    while others and not others[-1]:
+        others.pop()
     return {
         "start": start.isoformat(),
         "end": end.isoformat(),
@@ -108,10 +111,11 @@ def parse_line(line):
         "title": title,
         "tags": tags,
         "place": others[0] if others else "",
-        "memo": ", ".join(others[1:]),
+        "memo": ", ".join(f for f in others[1:] if f),
         "holiday": holiday,
         "important": important,
         "italic": italic,
+        "raw": raw,
     }
 
 

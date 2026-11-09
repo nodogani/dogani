@@ -35,11 +35,13 @@
   }
   const eventColor = (ev) => (ev.tags && ev.tags.length ? `hsl(${tagHue(ev.tags[0])} 70% 50%)` : "var(--accent)");
 
-  /** 일정 목록 → { byDate: {iso: [ev]}, off: Set(iso) } */
+  /** 일정 목록 → { byDate: {iso: [ev]}, off: Set(iso), list } (ev.k = list 안 번호, 달력에서 data-k 로 찾음) */
   function index(events) {
     const byDate = {};
     const off = new Set();
-    for (const ev of events || []) {
+    const list = events || [];
+    list.forEach((ev, k) => { ev.k = k; });
+    for (const ev of list) {
       let d = ev.start;
       for (let k = 0; d <= ev.end && k < 366; k++, d = addDays(d, 1)) {
         (byDate[d] = byDate[d] || []).push(ev);
@@ -48,7 +50,7 @@
         if (ev.holiday && !fake) off.add(d);
       }
     }
-    return { byDate, off };
+    return { byDate, off, list };
   }
 
   const isWeekend = (s) => { const w = parseISO(s).getDay(); return w === 0 || w === 6; };
@@ -78,7 +80,7 @@
   const timeText = (ev) => (ev.time || "") + q(ev);
   const shortTime = (ev) => (ev.time || "").split("-")[0] + q(ev);
   // 공용 일정(ev.team)은 점선 테두리 + 툴팁에 [공용] 표시
-  const evAttrs = (ev, cls) => `class="${cls.concat(ev.team ? ["team"] : []).join(" ")}" style="--ev:${eventColor(ev)}" ` +
+  const evAttrs = (ev, cls) => `class="${cls.concat(ev.team ? ["team"] : []).join(" ")}" data-k="${ev.k ?? ""}" style="--ev:${eventColor(ev)}" ` +
     `title="${esc((ev.team ? "[공용] " : "") + eventTip(ev))}"`;
 
   /** 노트 위 일정 줄용 칩 (시간·장소까지) */
@@ -153,8 +155,9 @@
       cells[s][lane] = rangeBar(ev, e - s + 1, week[s] === ev.start, week[e] === ev.end);
       for (let k = s + 1; k <= e; k++) cells[k][lane] = '<span class="ev spacer"></span>';
     }
-    // 중간에 빈 줄은 자리 맞춤용 빈칸 (칸 아래쪽 남는 빈 줄은 빼서 하루 일정이 위로 붙게)
-    return cells.map((c) => Array.from({ length: c.length }, (_, l) => c[l] || '<span class="ev spacer"></span>'));
+    // 한 주의 모든 칸을 같은 줄 수로 채움 (띠 영역 높이가 같아야 옆 칸과 줄이 맞음)
+    const n = laneEnd.length;
+    return cells.map((c) => Array.from({ length: n }, (_, l) => c[l] || '<span class="ev spacer"></span>'));
   }
 
   /**
@@ -190,33 +193,36 @@
         const c = info.total === 0 ? "none" : info.done === info.total ? "done" : "";
         count = `<span class="count ${c}">${info.done}/${info.total}</span>`;
       }
-      const items = lanes[k % 7].concat(singles.map(dayItem));
-      const list = items.length ? `<div class="evs">${items.join("")}</div>` : "";
+      // 하루 일정은 위(남는 자리만, 넘치면 +N), 기간 띠는 칸 아래 고정 영역 (숨기지 않아 옆 칸과 줄이 항상 맞음)
+      const lane = lanes[k % 7];
+      const list = singles.length || lane.length ? `<div class="evs"><div class="singles">${singles.map(dayItem).join("")}</div>` +
+        (lane.length ? `<div class="lanes">${lane.join("")}</div>` : "") + "</div>" : "";
       html += `<div class="${cls.join(" ")}" data-date="${d}"><span class="num">${cursor.getDate()}</span>${list}${count}</div>`;
       cursor.setDate(cursor.getDate() + 1);
     }
     return { html, notes, done, total };
   }
 
-  /** 칸 높이를 넘는 일정은 숨기고 "+N" 표시 (그린 뒤·창 크기 바뀐 뒤 호출) */
+  /** 칸에 안 들어가는 하루 일정은 숨기고 "+N" 표시 (그린 뒤·크기 바뀐 뒤 호출). 기간 띠는 건드리지 않음 */
   function fitCells(grid) {
-    for (const box of grid.querySelectorAll(".evs")) {
-      box.querySelector(".ev-more")?.remove();
+    for (const cell of grid.querySelectorAll(".cal-day")) {
+      cell.querySelectorAll(".ev-more").forEach((el) => el.remove());
+      const box = cell.querySelector(".singles");
+      if (!box) continue;
       const items = [...box.children];
       for (const el of items) el.hidden = false;
-      if (box.scrollHeight <= box.clientHeight + 1) continue;
+      if (!items.length || box.scrollHeight <= box.clientHeight + 1) continue;
       const more = document.createElement("span");
       more.className = "ev ev-more";
-      box.append(more);
-      // 띠(기간 일정)는 옆 칸과 줄이 맞아야 하므로 뒤(하루 일정)부터 숨김
+      cell.querySelector(".num").after(more);  // +N 은 늘 날짜 숫자 오른쪽 (일정 칸 자리를 안 먹음)
       let hidden = 0;
-      for (let k = items.length - 1; k >= 0 && box.scrollHeight > box.clientHeight + 1; k--) {
+      for (let k = items.length - 1; k >= 0; k--) {
+        if (box.scrollHeight <= box.clientHeight + 1) break;
         items[k].hidden = true;
-        if (!items[k].classList.contains("spacer")) hidden++;
-        more.textContent = `+${hidden}`;
-        more.title = items.filter((el) => el.hidden && el.title).map((el) => el.title).join("\n\n");
+        hidden++;
       }
-      if (!hidden) more.remove();
+      more.textContent = `+${hidden}`;
+      more.title = items.filter((el) => el.hidden).map((el) => el.title).join("\n\n");
     }
   }
 
