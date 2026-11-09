@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFileDia
 
 import liveupdate
 from server import CLIENT_KEY, HOST_HEADER, KEY_HEADER, TOKEN_HEADER, USER_HEADER, ShareServer
-from team import NAME_MAX, TeamHost, clean_name, valid_pin
+from team import NAME_MAX, TeamError, TeamHost, clean_name
 
 APP_NAME = "Dogani"
 CONFIG_DIR = os.environ.get("DOGANI_HOME") or os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Dogani")
@@ -360,12 +360,23 @@ class Tray(QObject):
             if m["admin"]:
                 items.append(Item(f"{m['name']}  - 관리자(이 PC)", None, enabled=False))
                 continue
-            state = "PIN 초기화됨 (다시 참여 대기)" if m["pending"] else "접속 중" if m["online"] else "꺼짐"
+            state = "접속 중" if m["online"] else "꺼짐"
             items.append(Item(f"{m['name']}  - {state}", pystray.Menu(
-                Item("PIN 초기화 (잊어버렸을 때)", self.emit("reset_pin", m["id"])),
+                Item("다시 초대 (PC 바꿈, 초대장 복사)", self.emit("reinvite", m["id"])),
                 Item("팀에서 내보내기", self.emit("kick", m["id"])),
             )))
         return items
+
+    def invite_items(self):
+        Item = pystray.MenuItem
+        team = self.app.share.team if self.app.share else None
+        invites = team.invites() if team else []
+        if not invites:
+            return [Item("(없음)", None, enabled=False)]
+        return [Item(f"{i['code']}  - {i['label']}, {max(1, i['left'] // 60)}분 남음", pystray.Menu(
+                    Item("복사", self.emit("copy_invite", i["code"])),
+                    Item("폐기", self.emit("cancel_invite", i["code"])),
+                )) for i in invites]
 
     def team_menu(self):
         Item = pystray.MenuItem
@@ -374,9 +385,9 @@ class Tray(QObject):
         if app.share and app.share.team:
             team = app.share.team
             return pystray.Menu(
-                Item(f"참여 코드 {team.code}  (클릭 시 복사)", self.emit("copy_code")),
+                Item("새 팀원 초대장 만들기 (15분, 복사됨)", self.emit("new_invite")),
+                Item("초대장 관리", pystray.Menu(lambda: self.invite_items())),
                 Item(f"호스트 주소 {app.share.address}  (클릭 시 복사)", self.emit("copy_address")),
-                Item("참여 코드 새로 만들기", self.emit("renew_code")),
                 pystray.Menu.SEPARATOR,
                 Item("팀원", pystray.Menu(lambda: self.member_items())),
                 Item("팀 이름 바꾸기...", self.emit("rename_team")),
@@ -387,14 +398,12 @@ class Tray(QObject):
         if t.get("token"):
             return pystray.Menu(
                 Item(f"호스트 {t['host']}  - {TEAM_STATUS.get(app.team_status, '')}", None, enabled=False),
-                Item("PIN 바꾸기...", self.emit("change_pin")),
-                Item("다시 로그인...", self.emit("login_team")),
+                Item("초대장으로 다시 참여...", self.emit("join_team")),
                 pystray.Menu.SEPARATOR,
                 Item("팀 나가기 (이 PC 에서 로그아웃)", self.emit("leave_team")),
             )
         return pystray.Menu(
-            Item("팀 참여... (참여 코드)", self.emit("join_team")),
-            Item("로그인... (다른 PC 에서 참여했던 계정)", self.emit("login_team")),
+            Item("팀 참여... (초대장)", self.emit("join_team")),
             pystray.Menu.SEPARATOR,
             Item("이 PC 를 팀 호스트로 (새 팀 만들기)", self.emit("start_host"), enabled=bool(app.share)),
         )
@@ -476,41 +485,22 @@ class Tray(QObject):
 
 # ---------------------------------------------------------------- dialogs (Windows 기본 위젯)
 class TeamDialog(QDialog):
-    """팀 참여(join) / 로그인(login) / PIN 바꾸기(pin)"""
+    """팀 참여 (호스트 주소 + 초대장 코드 + 이름)"""
 
-    def __init__(self, mode, host="", name=""):
+    def __init__(self, host="", name=""):
         super().__init__(None, Qt.WindowType.WindowStaysOnTopHint)
-        self.mode = mode
-        self.setWindowTitle({"join": "팀 참여", "login": "팀 로그인", "pin": "PIN 바꾸기"}[mode])
+        self.setWindowTitle("팀 참여")
         form = QFormLayout()
-        self.host = QLineEdit(host, placeholderText="예) 192.168.0.10  (호스트 트레이 > 팀스페이스에서 확인)")
-        self.code = QLineEdit(placeholderText="숫자 6자리", maxLength=6)
+        self.host = QLineEdit(host, placeholderText="예) 192.168.0.10  (관리자에게 받기)")
+        self.code = QLineEdit(placeholderText="XXXX-XXXX-XXXX", maxLength=20)
         self.name = QLineEdit(name, maxLength=NAME_MAX)
-        self.old_pin = QLineEdit(echoMode=QLineEdit.EchoMode.Password, maxLength=8)
-        self.pin = QLineEdit(echoMode=QLineEdit.EchoMode.Password, maxLength=8, placeholderText="숫자 4~8자리")
-        self.pin2 = QLineEdit(echoMode=QLineEdit.EchoMode.Password, maxLength=8)
-        if mode in ("join", "login"):
-            form.addRow("호스트 주소", self.host)
-        if mode == "join":
-            form.addRow("참여 코드", self.code)
-        if mode in ("join", "login"):
-            form.addRow("내 이름", self.name)
-        if mode == "pin":
-            form.addRow("지금 PIN", self.old_pin)
-        form.addRow("PIN" if mode != "pin" else "새 PIN", self.pin)
-        if mode != "login":
-            form.addRow("PIN 확인", self.pin2)
-        hint = {
-            "join": "참여 코드는 팀 호스트(관리자) PC 트레이에 있습니다.\n"
-                    "PIN 은 다른 PC 에서 로그인할 때만 다시 묻습니다.",
-            "login": "다른 PC 에서 참여할 때 정한 이름과 PIN 을 입력하세요.\n"
-                     "PIN 을 잊었으면 관리자에게 'PIN 초기화'를 부탁한 뒤 '팀 참여'로 다시 들어오세요.",
-            "pin": "",
-        }[mode]
+        form.addRow("호스트 주소", self.host)
+        form.addRow("초대장 코드", self.code)
+        form.addRow("내 이름", self.name)
         layout = QVBoxLayout(self)
         layout.addLayout(form)
-        if hint:
-            layout.addWidget(QLabel(hint))
+        layout.addWidget(QLabel("초대장은 관리자가 사람마다 따로 만들어 줍니다. (15분 안에 한 번만 쓸 수 있음)\n"
+                                "PC 를 바꿨으면 관리자에게 '다시 초대'를 부탁하세요. 그때 이름은 예전 그대로 쓰입니다."))
         self.error = QLabel()
         self.error.setStyleSheet("color: #c0392b")
         layout.addWidget(self.error)
@@ -522,16 +512,12 @@ class TeamDialog(QDialog):
         self.setMinimumWidth(380)
 
     def check(self):
-        if self.mode in ("join", "login") and not normalize_server(self.host.text()):
+        if not normalize_server(self.host.text()):
             return self.error.setText("호스트 주소를 입력하세요.")
-        if self.mode == "join" and not self.code.text().strip():
-            return self.error.setText("참여 코드를 입력하세요.")
-        if self.mode in ("join", "login") and not clean_name(self.name.text()):
+        if not self.code.text().strip():
+            return self.error.setText("초대장 코드를 입력하세요.")
+        if not clean_name(self.name.text()):
             return self.error.setText("이름을 입력하세요.")
-        if not valid_pin(self.pin.text()):
-            return self.error.setText("PIN 은 숫자 4~8자리입니다.")
-        if self.mode != "login" and self.pin.text() != self.pin2.text():
-            return self.error.setText("PIN 확인이 맞지 않습니다.")
         msg = self.handler(self) if self.handler else None
         if msg:
             self.error.setText(msg)
@@ -603,7 +589,7 @@ class Bridge(QObject):
 
     @Slot(str)
     def action(self, name):
-        if name in ("join_team", "login_team", "rename", "add_server", "start_host"):
+        if name in ("join_team", "rename", "add_server", "start_host"):
             self.win.app.on_command(name, None)
 
     @Slot(str)
@@ -1054,7 +1040,7 @@ class DoganiApp(QObject):
         elif status == 401:
             self.team_status = "logged_out"
             if prev != "logged_out":
-                self.tray.notify("팀 로그인이 풀렸습니다. (내보내졌거나 PIN 이 초기화됨)\n트레이 > 팀스페이스에서 다시 로그인하세요.")
+                self.tray.notify("팀 로그인이 풀렸습니다. (내보내졌거나 다른 PC 로 다시 초대됨)\n관리자에게 초대장을 받아 다시 참여하세요.")
         else:
             self.team_status = "offline"
         self.apply_team_auth()
@@ -1084,17 +1070,13 @@ class DoganiApp(QObject):
         if hasattr(self, "tray"):   # 시작할 때(트레이 만들기 전) 호스트를 여는 경우
             self.tray.update()
 
-    def join_team(self, mode):
+    def join_team(self):
         t = self.cfg["team"]
-        dlg = TeamDialog(mode, "" if t.get("host", "").startswith("127.") else t.get("host", ""), self.cfg["name"])
+        dlg = TeamDialog("" if t.get("host", "").startswith("127.") else t.get("host", ""), self.cfg["name"])
 
         def handler(d):
             host = normalize_server(d.host.text())
-            if mode == "join":
-                ok, res = self.team_request(host, "/api/team/join",
-                                            {"code": d.code.text().strip(), "name": d.name.text(), "pin": d.pin.text()})
-            else:
-                ok, res = self.team_request(host, "/api/team/login", {"name": d.name.text(), "pin": d.pin.text()})
+            ok, res = self.team_request(host, "/api/team/join", {"code": d.code.text(), "name": d.name.text()})
             if not ok:
                 return res
             self.set_session(host, res)
@@ -1104,21 +1086,9 @@ class DoganiApp(QObject):
         if dlg.exec():
             self.tray.notify(f"{self.cfg['team'].get('team') or '팀'}에 {self.cfg['name']}(으)로 들어왔습니다.")
 
-    def change_pin(self):
-        dlg = TeamDialog("pin")
-
-        def handler(d):
-            ok, res = self.team_request(self.cfg["team"]["host"], "/api/team/profile",
-                                        {"pin": d.pin.text(), "old_pin": d.old_pin.text()})
-            return None if ok else res
-
-        dlg.handler = handler
-        if dlg.exec():
-            self.tray.notify("PIN 을 바꿨습니다.")
-
     def leave_team(self):
         if QMessageBox.question(None, APP_NAME, "이 PC 에서 팀 로그아웃할까요?\n(팀원 목록에서 지워지지는 않습니다. "
-                                "나중에 이름 + PIN 으로 다시 로그인할 수 있습니다.)") != QMessageBox.StandardButton.Yes:
+                                "다시 들어오려면 관리자에게 초대장을 받으세요.)") != QMessageBox.StandardButton.Yes:
             return
         self.cfg["team"] = dict(EMPTY_TEAM)
         if self.cfg["space"] == TEAM or self.cfg["space"].startswith("m:"):
@@ -1150,8 +1120,9 @@ class DoganiApp(QObject):
         if not quiet:
             QMessageBox.information(
                 None, APP_NAME,
-                f"팀 호스트를 열었습니다.\n\n팀원에게 알려 줄 것:\n  호스트 주소  {self.share.ip}\n  참여 코드  {host.code}\n\n"
-                "팀원은 트레이 > 팀스페이스 > 팀 참여 에서 입력합니다.\n"
+                f"팀 호스트를 열었습니다.\n\n팀원 초대: 트레이 > 팀스페이스 > 새 팀원 초대장 만들기\n"
+                f"  → 호스트 주소({self.share.address})와 초대장 코드가 복사되니 그 사람에게 보내 주세요.\n"
+                "  (사람마다 하나씩, 15분 안에 한 번만 쓸 수 있음)\n\n"
                 "이 PC 가 꺼져 있으면 공용 공간을 볼 수 없으니, 켜 두는 시간이 긴 PC 를 추천합니다.")
 
     def stop_host(self):
@@ -1325,21 +1296,26 @@ class DoganiApp(QObject):
             self.select_space(arg)
         elif name == "rename":
             self.rename()
-        elif name in ("join_team", "login_team"):
-            self.join_team("join" if name == "join_team" else "login")
-        elif name == "change_pin":
-            self.change_pin()
+        elif name == "join_team":
+            self.join_team()
         elif name == "leave_team":
             self.leave_team()
         elif name == "start_host":
             self.start_host()
         elif name == "stop_host":
             self.stop_host()
-        elif name == "copy_code" and team:
-            QGuiApplication.clipboard().setText(team.code)
-        elif name == "renew_code" and team:
-            team.renew_code()
-            self.tray.notify(f"새 참여 코드: {team.code}\n(이미 들어온 팀원에게는 영향 없음)")
+        elif name in ("new_invite", "reinvite", "copy_invite") and team:
+            try:
+                code = arg if name == "copy_invite" else team.create_invite(arg if name == "reinvite" else None)
+            except TeamError as e:
+                return self.tray.notify(e.message)
+            if all(i["code"] != code for i in team.invites()):
+                return self.tray.notify("만료됐거나 폐기된 초대장입니다. 새로 만드세요.")
+            QGuiApplication.clipboard().setText(f"dogani 팀 참여\n호스트 주소: {self.share.address}\n초대장 코드: {code}")
+            if name != "copy_invite":
+                self.tray.notify(f"초대장 {code} 를 복사했습니다. (15분 안에 한 번만 사용)\n메신저로 그 사람에게 붙여 넣어 보내세요.")
+        elif name == "cancel_invite" and team:
+            team.cancel_invite(arg)
         elif name == "rename_team" and team:
             text, ok = QInputDialog.getText(None, "팀 이름", "공용 공간 이름", QLineEdit.EchoMode.Normal, team.name)
             if ok and clean_name(text):
@@ -1347,9 +1323,6 @@ class DoganiApp(QObject):
                 self.poll_team()
         elif name == "open_team_dir" and team:
             os.startfile(team.notes_dir)
-        elif name == "reset_pin" and team:
-            team.reset_pin(arg)
-            self.tray.notify(f"PIN 을 초기화했습니다. 그 사람은 참여 코드({team.code}) + 같은 이름 + 새 PIN 으로 다시 참여하면 됩니다.")
         elif name == "kick" and team:
             m = next((m for m in team.members() if m["id"] == arg), None)
             if m and QMessageBox.question(None, APP_NAME, f"{m['name']} 님을 팀에서 내보낼까요?") == QMessageBox.StandardButton.Yes:

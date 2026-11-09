@@ -5,17 +5,16 @@
   공용 노트·공용 일정은 호스트 PC 의 폴더(기본 %APPDATA%\\Dogani\\team\\notes)에 평범한 md 파일로 저장
   → 옵시디언으로 열 수 있고, 백업은 폴더 복사
 - 인증 (IT 회사가 아닌 사무실 수준):
-  * 팀 참여 = 호스트 주소 + 참여 코드(6자리, 호스트 트레이에 표시) + 이름 + PIN(숫자 4~8자리)
-  * 한 번 참여하면 PC 에 토큰을 저장해서 다시 묻지 않음. 다른 PC 에서는 이름 + PIN 으로 로그인
-  * PIN 은 솔트+PBKDF2 해시로만 저장, 5번 틀리면 그 IP 는 1분 동안 로그인 금지
+  * 팀 참여 = 호스트 주소 + 초대장 코드(사람마다 다름, 12자리, 한 번 쓰면 폐기, 15분 뒤 만료) + 이름
+  * 한 번 참여하면 PC 에 토큰을 저장해서 다시 묻지 않음. PC 를 바꾸면 호스트가 그 사람 자리로 다시 초대
+    (다시 초대로 들어오면 예전 PC 의 토큰은 무효)
+  * 초대장 코드를 5번 틀리면 그 IP 는 1분 동안 참여 금지
   * 토큰 = 팀원ID.발급시각.Ed25519 서명. 서명 키(개인키)는 호스트 PC 에만 있고, 팀원 PC 들은
     공개키만 받아서 토큰을 직접 검증한다 → 호스트가 꺼져 있어도 "팀원에게만 공유" 가 동작하고,
     팀원(또는 내보낸 사람)이 공개키로 토큰을 위조할 수는 없다
-  * 내보내기 = 팀원 목록에서 삭제, PIN 초기화 = min_iat 올림. 둘 다 팀원 목록과 함께 각 PC 로 전파
+  * 내보내기 = 팀원 목록에서 삭제, 다시 초대로 참여 = min_iat 올림. 둘 다 팀원 목록과 함께 각 PC 로 전파
 """
 import datetime as dt
-import hashlib
-import hmac
 import json
 import os
 import secrets
@@ -25,7 +24,9 @@ from functools import lru_cache
 
 import ed25519
 
-PIN_ITER = 120_000
+INVITE_TTL = 15 * 60    # 초대장 유효 시간(초)
+INVITE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # 헷갈리는 0/O, 1/I 제외
+INVITE_LEN = 12         # 32^12 ≈ 60비트
 FAIL_LIMIT = 5
 FAIL_LOCK = 60          # 초
 ONLINE_WINDOW = 75      # 마지막 신호가 이 안이면 접속 중 (클라이언트는 20초마다 보냄)
@@ -89,7 +90,7 @@ class TeamAuth:
         return self.joined
 
     def verify(self, token):
-        """토큰 → (id, 이름) 또는 None. 내보낸 사람(목록에 없음)·PIN 초기화 이전 토큰은 거부"""
+        """토큰 → (id, 이름) 또는 None. 내보낸 사람(목록에 없음)·다시 초대 이전 토큰은 거부"""
         with self.lock:
             pub, members = self.pub, dict(self.members)
         parsed = parse_token(pub, token) if pub and _shape_ok(token, members) else None
@@ -101,21 +102,14 @@ class TeamAuth:
         return mid, members.get(mid, ("", 0))[0]
 
 
-# ---------------------------------------------------------------- pin
-def hash_pin(pin, salt=None):
-    salt = salt or secrets.token_hex(16)
-    h = hashlib.pbkdf2_hmac("sha256", pin.encode(), bytes.fromhex(salt), PIN_ITER).hex()
-    return {"salt": salt, "hash": h}
+# ---------------------------------------------------------------- invite
+def normalize_invite(code):
+    """입력한 초대장 코드 → 대문자·구분자 제거 (XXXX-XXXX-XXXX 로 보여 주고, 띄어쓰기·소문자도 받음)"""
+    return "".join(c for c in str(code or "").upper() if c.isalnum())
 
 
-def check_pin(pin, rec):
-    if not rec:
-        return False
-    return hmac.compare_digest(hash_pin(pin, rec["salt"])["hash"], rec["hash"])
-
-
-def valid_pin(pin):
-    return isinstance(pin, str) and pin.isdigit() and 4 <= len(pin) <= 8
+def format_invite(code):
+    return "-".join(code[i:i + 4] for i in range(0, len(code), 4))
 
 
 def clean_name(name):
@@ -133,7 +127,7 @@ class TeamError(Exception):
 
 # ---------------------------------------------------------------- host
 class TeamHost:
-    """팀 호스트 데이터: team.json(팀원·비밀키·참여 코드) + notes 폴더(공용 노트·일정)"""
+    """팀 호스트 데이터: team.json(팀원·서명 키·초대장) + notes 폴더(공용 노트·일정)"""
 
     def __init__(self, folder, owner_name):
         from server import Hub, NoteStore  # 순환 import 방지
@@ -167,13 +161,19 @@ class TeamHost:
             data = {}
         data.setdefault("name", "팀 공용")
         # 예전 HMAC 비밀키는 팀원 PC 에 퍼져 있어서 위조에 쓰일 수 있음 → 버리고 서명 키로 교체
-        # (예전 토큰은 모두 무효, 팀원은 이름 + PIN 으로 한 번 다시 로그인)
+        # (예전 토큰은 모두 무효, 팀원은 초대장으로 한 번 다시 참여)
         if "secret" in data or "sign_key" not in data:
             data.pop("secret", None)
             data.setdefault("sign_key", secrets.token_hex(32))
             data["_dirty"] = True
-        data.setdefault("code", self._new_code())
+        # 예전 공용 참여 코드·PIN 은 초대장으로 바뀜 → 지움 (이미 들어온 팀원 토큰은 그대로 유효)
+        if data.pop("code", None) is not None:
+            data["_dirty"] = True
         data.setdefault("members", {})
+        for m in data["members"].values():
+            if m.pop("pin", 0) != 0:
+                data["_dirty"] = True
+        data.setdefault("invites", {})
         return data
 
     def _save(self):
@@ -182,24 +182,9 @@ class TeamHost:
             json.dump(self.data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, self.path)
 
-    @staticmethod
-    def _new_code():
-        return f"{secrets.randbelow(1_000_000):06d}"
-
-    # -- properties
-    @property
-    def code(self):
-        return self.data["code"]
-
     @property
     def name(self):
         return self.data["name"]
-
-    def renew_code(self):
-        with self.lock:
-            self.data["code"] = self._new_code()
-            self._save()
-            return self.data["code"]
 
     def rename_team(self, name):
         name = clean_name(name)
@@ -217,7 +202,7 @@ class TeamHost:
         return None
 
     def _ensure_owner(self, name):
-        """호스트 PC 주인은 PIN 없이 자동으로 관리자 팀원"""
+        """호스트 PC 주인은 초대장 없이 자동으로 관리자 팀원"""
         with self.lock:
             for mid, m in self.data["members"].items():
                 if m.get("admin"):
@@ -226,7 +211,7 @@ class TeamHost:
             if self._find_name(name):
                 name += "(관리자)"
             mid = secrets.token_hex(4)
-            self.data["members"][mid] = {"name": name, "pin": None, "admin": True, "min_iat": 0,
+            self.data["members"][mid] = {"name": name, "admin": True, "min_iat": 0,
                                          "joined": dt.datetime.now().isoformat(timespec="seconds"),
                                          "addr": "", "last_seen": 0}
             self._save()
@@ -248,51 +233,95 @@ class TeamHost:
         f[1] = time.time() + FAIL_LOCK
         raise TeamError(code, message, 401)
 
-    def join(self, ip, code, name, pin):
-        """참여 코드 + 이름 + PIN → 토큰. PIN 이 초기화된 기존 이름이면 새 PIN 으로 다시 참여"""
-        self._limit(ip)
-        name = clean_name(name)
-        if not name:
-            raise TeamError("bad_name", "이름을 입력하세요.")
-        if not valid_pin(pin):
-            raise TeamError("bad_pin", "PIN 은 숫자 4~8자리입니다.")
+    # -- invites
+    def _purge(self):
+        """만료된 초대장 정리 (lock 안에서 부름) → 바뀌었으면 True"""
+        now = time.time()
+        old = [c for c, v in self.data["invites"].items() if v.get("exp", 0) <= now]
+        for c in old:
+            del self.data["invites"][c]
+        return bool(old)
+
+    def _drop_invites(self, mid):
+        """그 팀원 자리로 만든 초대장 모두 삭제 (lock 안에서 부름)"""
+        for c in [c for c, v in self.data["invites"].items() if v.get("mid") == mid]:
+            del self.data["invites"][c]
+
+    def create_invite(self, mid=None):
+        """일회용 초대장 → 코드(XXXX-XXXX-XXXX). mid 를 주면 그 팀원 자리로 다시 초대(PC 바꿈)"""
+        code = "".join(secrets.choice(INVITE_ALPHABET) for _ in range(INVITE_LEN))
         with self.lock:
-            if not hmac.compare_digest(str(code or "").strip(), self.code):
-                pass
-            else:
-                mid = self._find_name(name)
+            m = self.data["members"].get(mid) if mid else None
+            if mid and (not m or m.get("admin")):
+                raise TeamError("not_member", "팀원이 아닙니다.", 404)
+            self._purge()
+            if mid:
+                self._drop_invites(mid)   # 다시 초대는 한 사람당 한 장만 살아 있게
+            self.data["invites"][code] = {"exp": int(time.time()) + INVITE_TTL, "mid": mid or ""}
+            self._save()
+        return format_invite(code)
+
+    def cancel_invite(self, code):
+        with self.lock:
+            if self.data["invites"].pop(normalize_invite(code), None) is not None:
+                self._save()
+
+    def invites(self):
+        """아직 안 쓴 초대장 [{code, label, left(초)}], 남은 시간 짧은 순"""
+        now = time.time()
+        with self.lock:
+            if self._purge():
+                self._save()
+            out = []
+            for c, v in self.data["invites"].items():
+                m = self.data["members"].get(v.get("mid") or "")
+                out.append({"code": format_invite(c), "left": int(v["exp"] - now),
+                            "label": f"{m['name']} 다시 초대" if m else "새 팀원"})
+        return sorted(out, key=lambda i: i["left"])
+
+    def join(self, ip, code, name):
+        """초대장 코드 (+ 새 팀원이면 이름) → 토큰. 성공하면 초대장은 폐기"""
+        self._limit(ip)
+        code = normalize_invite(code)
+        with self.lock:
+            purged = self._purge()
+            inv = self.data["invites"].get(code) if len(code) == INVITE_LEN else None
+            if inv is not None:
+                mid = inv.get("mid") or ""
                 if mid:
-                    m = self.data["members"][mid]
-                    if m.get("pin") or m.get("admin"):
-                        raise TeamError("name_taken", "이미 있는 이름입니다. 본인이면 '로그인'을 쓰세요.", 409)
+                    m = self.data["members"].get(mid)
+                    if not m:   # 그 사이 내보냄 (보통은 kick 이 초대장도 지움)
+                        del self.data["invites"][code]
+                        self._save()
+                        raise TeamError("bad_code", "초대장 대상이 팀에 없습니다. 관리자에게 새 초대장을 받으세요.", 404)
+                    self._drop_invites(mid)
+                    iat = int(time.time()) + 1
+                    m["min_iat"] = iat   # 예전 PC 의 토큰(같은 1초 것 포함)은 무효, 새 토큰만 통과
                 else:
+                    name = clean_name(name)
+                    if not name:
+                        raise TeamError("bad_name", "이름을 입력하세요.")
+                    if self._find_name(name):
+                        raise TeamError("name_taken", "이미 있는 이름입니다. 본인이면 관리자에게 '다시 초대'를 부탁하세요.", 409)
                     mid = secrets.token_hex(4)
-                    m = self.data["members"][mid] = {
+                    self.data["members"][mid] = {
                         "name": name, "admin": False, "min_iat": 0, "addr": "", "last_seen": 0,
                         "joined": dt.datetime.now().isoformat(timespec="seconds")}
-                m["pin"] = hash_pin(pin)
+                    iat = None
+                self.data["invites"].pop(code, None)
                 self._save()
                 self.fails.pop(ip, None)
-                return self._session(mid)
-        self._fail(ip, "bad_code", "참여 코드가 맞지 않습니다.")
+                return self._session(mid, iat)
+            if purged:
+                self._save()
+        self._fail(ip, "bad_code", "초대장 코드가 맞지 않거나 만료됐습니다. (15분 안에 한 번만 쓸 수 있음)")
 
-    def login(self, ip, name, pin):
-        self._limit(ip)
-        with self.lock:
-            mid = self._find_name(clean_name(name))
-            m = self.data["members"].get(mid) if mid else None
-            ok = m is not None and check_pin(str(pin or ""), m.get("pin"))
-        if not ok:
-            self._fail(ip, "bad_login", "이름 또는 PIN 이 맞지 않습니다.")
-        self.fails.pop(ip, None)
-        return self._session(mid)
-
-    def _session(self, mid):
-        token = make_token(self.data["sign_key"], mid)
+    def _session(self, mid, iat=None):
+        token = make_token(self.data["sign_key"], mid, iat)
         return {"token": token, "id": mid, "name": self.data["members"][mid]["name"]}
 
     def member(self, token):
-        """토큰 → 팀원 id (내보냈거나 PIN 초기화 이전 토큰이면 None)"""
+        """토큰 → 팀원 id (내보냈거나 다시 초대 이전 토큰이면 None)"""
         with self.lock:
             known = set(self.data["members"])
         if not _shape_ok(token, known):
@@ -316,7 +345,7 @@ class TeamHost:
                     m["addr"] = addr
                     self._save()
 
-    def update_profile(self, mid, name=None, pin=None, old_pin=None):
+    def update_profile(self, mid, name=None):
         with self.lock:
             m = self.data["members"].get(mid)
             if not m:
@@ -329,12 +358,6 @@ class TeamHost:
                 if other and other != mid:
                     raise TeamError("name_taken", "다른 팀원이 쓰는 이름입니다.", 409)
                 m["name"] = name
-            if pin is not None:
-                if not valid_pin(pin):
-                    raise TeamError("bad_pin", "PIN 은 숫자 4~8자리입니다.")
-                if m.get("pin") and not check_pin(str(old_pin or ""), m["pin"]):
-                    raise TeamError("bad_login", "지금 PIN 이 맞지 않습니다.", 401)
-                m["pin"] = hash_pin(pin)
             self._save()
             return m["name"]
 
@@ -343,15 +366,7 @@ class TeamHost:
             m = self.data["members"].get(mid)
             if m and not m.get("admin"):
                 del self.data["members"][mid]
-                self._save()
-
-    def reset_pin(self, mid):
-        """PIN 을 지우고 기존 토큰을 무효화. 그 사람은 참여 코드 + 같은 이름 + 새 PIN 으로 다시 참여"""
-        with self.lock:
-            m = self.data["members"].get(mid)
-            if m and not m.get("admin"):
-                m["pin"] = None
-                m["min_iat"] = int(time.time()) + 1
+                self._drop_invites(mid)
                 self._save()
 
     def members(self):
@@ -360,7 +375,6 @@ class TeamHost:
             out = [{"id": mid, "name": m["name"], "addr": m.get("addr", ""), "admin": bool(m.get("admin")),
                     "min_iat": m.get("min_iat", 0),
                     "online": now - m.get("last_seen", 0) < ONLINE_WINDOW or bool(m.get("admin")),
-                    "pending": not m.get("pin") and not m.get("admin"),
                     "last_seen": m.get("last_seen", 0)}
                    for mid, m in self.data["members"].items()]
         return sorted(out, key=lambda m: (not m["admin"], m["name"]))

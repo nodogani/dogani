@@ -19,7 +19,7 @@
 | `app/launcher.py` | exe 진입점. `%APPDATA%\Dogani\app` 의 받은 코드 → 실패 시 exe 내장 코드 실행. 받은 `app.new` 적용 |
 | `app/dogani.py` | Qt 앱 본체: 설정, 트레이(pystray, Win32 기본 메뉴), 오버레이 창(QWebEngine), JS 브리지, 자동 실행, 이전 설정 이전 |
 | `app/server.py` | 공유 서버(ThreadingHTTPServer, 스레드). `NoteStore`(폴더 감시·읽기·쓰기), `Hub`(SSE·접속자·차단), 라우팅 |
-| `app/team.py` | 팀 호스트(`TeamHost`: 팀원·PIN·참여 코드·공용 노트), 토큰(`TeamAuth`) |
+| `app/team.py` | 팀 호스트(`TeamHost`: 팀원·초대장·공용 노트), 토큰(`TeamAuth`) |
 | `app/schedule.py` | 일정 파일 파서 |
 | `app/updater.py` | GitHub 최신 버전 태그 확인(`check`) / 받기(`stage`, 태그 zip 의 `app/` → `app.new`) |
 | `app/liveupdate.py` | exe: 실행 중 업데이트 확인만(트레이 표시, 재시작 안 함). 소스 실행: `devreload` 연결 |
@@ -51,7 +51,7 @@
 `name, todo_dir, port(8765), servers[], visible, mode, space, date, pos, panel, windows, on_top, opacity, theme, paused, blocked[], team, team_host, team_only`
 
 ### 3.4 팀 호스트 데이터 `%APPDATA%\Dogani\team\`
-- `team.json`: `name, sign_key(Ed25519 개인키 hex32, 호스트 밖으로 안 나감), code(참여 코드 6자리), members{id: name, PIN 해시, 마지막 신호, 주소}`
+- `team.json`: `name, sign_key(Ed25519 개인키 hex32, 호스트 밖으로 안 나감), invites{코드: {exp, mid}}, members{id: name, min_iat, 마지막 신호, 주소}` (예전 `code`·`pin` 필드는 로드 시 삭제)`
 - `notes/`: 공용 노트(3.1 과 같은 형식) + `일정.md`(처음에 예시로 생성)
 
 ## 4. HTTP API
@@ -70,10 +70,9 @@
 | `/api/schedule` | GET | 파싱된 일정 목록 |
 | `/api/sched-doc` | GET/POST | 일정 파일 원문 / 저장 |
 | `/api/team/hello` | GET | 호스트 확인 (인증 전) |
-| `/api/team/join` | POST | `{code, name, pin}` → 토큰·공개키(`pub`) |
-| `/api/team/login` | POST | `{name, pin}` → 토큰·공개키(`pub`) (5회 실패 시 IP 1분 잠금) |
+| `/api/team/join` | POST | `{code, name}` → 토큰·공개키(`pub`). 초대장은 성공 시 폐기, 다시 초대면 `name` 무시 (5회 실패 시 IP 1분 잠금) |
 | `/api/team/me?port=` | GET | 팀원 신호(20초 주기, 75초 안 = 접속 중) + 팀원 목록·비밀키 |
-| `/api/team/profile` | POST | 이름·PIN 변경 |
+| `/api/team/profile` | POST | 이름 변경 |
 | `/api/team/{info,events,note,month,schedule,sched-doc}` | | 개인 공간과 같은 형식, 팀원만 |
 | `/api/update`, `/api/update/app.zip` | GET | 배포 PC 에서만: 버전·sha256 / zip |
 
@@ -83,10 +82,11 @@
 ## 5. 인증·보안 (사무실 수준)
 
 - 개인 노트는 기본적으로 사내망 누구나 읽기 가능 (암호 없음). 차단·일시 중지·팀원 전용으로 제한
-- PIN: 숫자 4~8자리, 솔트 + PBKDF2(120,000회)
+- 초대장: 사람마다 다른 일회용 코드, `A-Z 2-9`(0·O·1·I 제외) 12자(약 60비트), `XXXX-XXXX-XXXX` 표시(입력은 대소문자·구분자 무시), 15분 뒤 만료. 호스트 트레이에서 만들기(클립보드에 주소+코드 복사)·목록·복사·폐기
+- 다시 초대(PC 바꿈) = 그 팀원 id 에 묶인 초대장. 쓰는 순간 그 사람의 다른 초대장 삭제 + `min_iat` = 지금+1초, 새 토큰 발급시각 = `min_iat` → 예전 PC 토큰 무효. 새로 다시 초대하면 이전 다시 초대 초대장은 폐기. 이름·PIN 로그인은 없음
 - 토큰: `팀원ID.발급시각.Ed25519서명(hex)`. 호스트만 개인키로 서명, 팀원 PC 는 `/api/team/me` 로 받은 공개키·팀원 목록(`min_iat` 포함)으로 직접 검증 → 호스트가 꺼져도 팀원 전용 공유 동작, 공개키로는 위조 불가
-- 내보내기 = 목록에서 삭제, PIN 초기화 = `min_iat` 올림. 각 PC 는 다음 `/me` 폴링(20초) 때 반영. 남은 팀원 토큰은 그대로 유효(키 교체 없음)
-- 예전 HMAC `secret` 은 로드 시 삭제 → 예전 토큰 전부 무효, 팀원은 이름 + PIN 으로 1회 재로그인
+- 내보내기 = 목록에서 삭제, 다시 초대로 참여 = `min_iat` 올림. 내보내면 그 사람 초대장도 삭제. 각 PC 는 다음 `/me` 폴링(20초) 때 반영. 남은 팀원 토큰은 그대로 유효(키 교체 없음)
+- 예전 HMAC `secret` 은 로드 시 삭제 → 예전 토큰 전부 무효, 팀원은 초대장으로 1회 다시 참여
 - 업데이트: GitHub `nodogani/dogani` 의 태그 zip(HTTPS)만 받음. 서명 확인 없음 (저장소 쓰기 권한 = 배포 권한)
 
 ## 6. 배포·업데이트

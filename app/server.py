@@ -396,7 +396,7 @@ class Handler(BaseHTTPRequestHandler):
         token = self.headers.get(TOKEN_HEADER, "")
         member = None
         if token:
-            if share.team:   # 내가 팀 호스트면 직접 확인 (내보낸 사람·PIN 초기화도 바로 반영)
+            if share.team:   # 내가 팀 호스트면 직접 확인 (내보낸 사람·다시 초대도 바로 반영)
                 mid = share.team.member(token)
                 if mid:
                     member = (mid, next((m["name"] for m in share.team.members() if m["id"] == mid), user))
@@ -465,12 +465,9 @@ class Handler(BaseHTTPRequestHandler):
         team = self.share.team
         if not team:
             return self._send_json({"error": "no_team", "message": "이 PC 는 팀 호스트가 아닙니다."}, 404)
-        if method == "POST" and path in ("/join", "/login"):
+        if method == "POST" and path == "/join":
             body = self._body()
-            if path == "/join":
-                res = team.join(ctx.ip, body.get("code"), body.get("name"), body.get("pin"))
-            else:
-                res = team.login(ctx.ip, body.get("name"), body.get("pin"))
+            res = team.join(ctx.ip, body.get("code"), body.get("name"))
             res.update(pub=team.pub, team=team.name)
             return self._send_json(res)
         if path == "/hello":   # 참여 전에 주소가 맞는지 확인용
@@ -488,7 +485,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"me": me, "members": members, "pub": team.pub, "team": team.name})
         if path == "/profile" and method == "POST":
             body = self._body()
-            name = team.update_profile(mid, body.get("name"), body.get("pin"), body.get("old_pin"))
+            name = team.update_profile(mid, body.get("name"))
             return self._send_json({"name": name})
         if path == "/info":
             return self._send_json({"app": "Dogani", "name": team.name, "kind": "team", "paused": False,
