@@ -149,7 +149,7 @@ class TeamHost:
         self.store = NoteStore()
         self.store.set_root(self.notes_dir)
         self.store.refresh()
-        self.store.pop_schedule_changed()
+        self.store.pop_changes()   # 처음 읽은 것은 알릴 필요 없음
         self.hub = Hub()
         self.owner_id = self._ensure_owner(owner_name)
 

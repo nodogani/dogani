@@ -106,7 +106,7 @@
     es.addEventListener("changed", (e) => {
       const dates = JSON.parse(e.data).dates || [];
       if (state.mode === "note" && dates.includes(state.noteDate)) note.reloadIfIdle();
-      if (state.mode === "cal" && dates.some((d) => d.startsWith(state.calYM))) loadMonth();
+      if (state.mode === "cal" && dates.some((d) => d.startsWith(state.calYM))) loadMonth(true);
     });
     es.addEventListener("reload", () => { loadSchedule(); refresh(); });
     es.onerror = () => {
@@ -158,7 +158,7 @@
 
   function rebuildSched() {
     state.sched = CAL.index(state.ownEvents.concat(state.teamEvents));
-    if (state.mode === "cal" && state.calView === "month") loadMonth();
+    if (state.mode === "cal" && state.calView === "month") renderMonth();
     if (state.mode === "note") renderSchedRow();
   }
 
@@ -379,22 +379,34 @@
   }
 
   // ------------------------------------------------------------ calendar (달력 창)
-  async function loadMonth() {
-    const ym = state.calYM;
+  // 받아 온 월 데이터 (일정만 바뀌거나 선택 날짜만 바뀌면 다시 받지 않고 그리기만)
+  let monthData = { key: "", days: {}, failed: false };
+  let monthReq = null;
+
+  async function loadMonth(force) {
+    const ym = state.calYM, key = state.base + "|" + ym;
     const [y, m] = ym.split("-").map(Number);
     $("cal-title").textContent = `${y}년 ${m}월`;
-    let days = {};
-    let failed = false;
-    try {
-      days = (await api(`/month?ym=${ym}`)).days;
-    } catch (e) {
-      failed = errorText(e);
+    // 같은 달을 동시에 여러 번 부르면(접속 직후 등) 요청 하나를 같이 기다림
+    if (force || !monthReq || monthReq.key !== key) {
+      const req = { key };
+      req.p = api(`/month?ym=${ym}`)
+        .then((r) => ({ key, days: r.days, failed: false }), (e) => ({ key, days: {}, failed: errorText(e) }))
+        .finally(() => { if (monthReq === req) monthReq = null; });
+      monthReq = req;
     }
-    if (ym !== state.calYM) return;
-    const r = CAL.renderMonth({ ym, days, idx: state.sched, today: state.today, selected: state.noteDate });
+    const data = await monthReq.p;
+    if (key !== state.base + "|" + state.calYM) return;
+    monthData = data;
+    renderMonth();
+  }
+
+  function renderMonth() {
+    if (monthData.key !== state.base + "|" + state.calYM) return loadMonth();
+    const r = CAL.renderMonth({ ym: state.calYM, days: monthData.days, idx: state.sched, today: state.today, selected: state.noteDate });
     $("cal-grid").innerHTML = r.html;
     CAL.fitCells($("cal-grid"));
-    $("cal-footer").textContent = failed ? failed : `노트 ${r.notes}개 · 완료 ${r.done}/${r.total}`;
+    $("cal-footer").textContent = monthData.failed || `노트 ${r.notes}개 · 완료 ${r.done}/${r.total}`;
   }
 
   const doc = DocPane({
@@ -506,7 +518,7 @@
     state.today = now;
     // 오늘 노트를 보고 있었다면 자정에 다음 날로 넘어간다 (편집 중이면 끝난 뒤에)
     if (state.mode === "note" && state.noteDate === prev && !note.editing) showNote(now);
-    if (state.mode === "cal") loadMonth();
+    if (state.mode === "cal" && state.calView === "month") renderMonth();
   }
 
   // ------------------------------------------------------------ events
@@ -602,8 +614,7 @@
         const d = await api("/sched-doc");
         if (d.no_dir) throw new Error("todo 폴더가 지정되지 않았습니다.");
         await api("/sched-doc", { content: fn(d.exists ? d.content : ""), base_mtime: d.exists ? d.mtime : undefined });
-        await loadSchedule();
-        loadMonth();
+        await loadSchedule();   // 달력은 rebuildSched 가 다시 그림
         return;
       } catch (e) {
         if (e.code === "conflict" && tries === 0) continue;  // 그 사이 파일이 바뀜
@@ -746,17 +757,21 @@
       c.classList.toggle("range-sel", !!r && d >= r[0] && d <= r[1]);
     }
   }
+  // 칸 위치는 누를 때 한 번만 잼 (끄는 동안 mousemove 마다 42칸 레이아웃을 읽지 않게)
+  let cellRects = null;
+  const measureCells = () => {
+    cellRects = [...$("cal-grid").querySelectorAll(".cal-day")].map((c) => [c, c.getBoundingClientRect()]);
+  };
   function cellAt(x, y) {
-    for (const c of $("cal-grid").querySelectorAll(".cal-day")) {
-      const r = c.getBoundingClientRect();
-      if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return c;
-    }
+    if (!cellRects) measureCells();
+    for (const [c, r] of cellRects) if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return c;
     return null;
   }
   const dayDiff = (a, b) => Math.round((parseISO(b) - parseISO(a)) / 86400000);
   const sorted = (a, b) => (a <= b ? [a, b] : [b, a]);
   $("cal-grid").addEventListener("mousedown", (e) => {
     dragged = false;
+    measureCells();
     const evEl = e.target.closest(".ev[data-k]");
     const ev = evOf(evEl);
     if (ev && e.button === 0) {
@@ -788,6 +803,7 @@
     if (move) {
       const m = move, n = dayDiff(m.from, m.to);
       move = null;
+      cellRects = null;
       m.el.classList.remove("moving");
       markRange(null);
       if (!n) return;  // 제자리 = 클릭 (수정 팝업은 click 에서)
@@ -907,7 +923,7 @@
         if (cfg.noteDate) state.noteDate = cfg.noteDate;
         if (first) { state.calYM = state.noteDate.slice(0, 7); setCalView("month"); }
         else if (moved) setCalView(state.calView);
-        else if (cfg.noteDate && state.calView === "month") loadMonth();
+        else if (cfg.noteDate && state.calView === "month") renderMonth();
       }
     },
     /** 달력 창에서 고른 날짜를 할일 창에 표시 */

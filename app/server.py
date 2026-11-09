@@ -58,6 +58,13 @@ def read_text(path):
     return data.decode("utf-8-sig", errors="replace")
 
 
+def atomic_write(path, content):
+    tmp = path + ".dogani.tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+    os.replace(tmp, path)
+
+
 def count_tasks(text):
     """체크박스 항목 수(하위 항목 포함). 공백이 아닌 상태 문자는 모두 완료로 본다(옵시디언 동작)."""
     done = total = 0
@@ -88,6 +95,7 @@ class NoteStore:
         self.sched_files = {}    # path -> (mtime_ns, size)
         self.events = []         # 일정 파일에서 읽은 일정
         self.sched_changed = False
+        self.pending = set()     # 아직 알리지 않은 바뀐 날짜 (publish 가 가져감)
 
     def set_root(self, root):
         with self.lock:
@@ -103,35 +111,40 @@ class NoteStore:
             return bool(self.root) and os.path.isdir(self.root)
 
     def _scan(self, root):
+        """1초마다 도는 폴더 스캔. Windows 는 scandir 항목에 stat 이 같이 와서 파일마다 시스템 호출이 없다"""
         found, sched = {}, {}
         if not root or not os.path.isdir(root):
             return found, sched
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-            for name in filenames:
-                if schedule.is_schedule_file(name):
-                    path = os.path.join(dirpath, name)
-                    try:
-                        st = os.stat(path)
-                        sched[path] = (st.st_mtime_ns, st.st_size)
-                    except OSError:
-                        pass
-                    continue
-                d = parse_note_date(name)
-                if d is None:
-                    continue
-                path = os.path.join(dirpath, name)
+        stack = [root]
+        while stack:
+            try:
+                with os.scandir(stack.pop()) as it:
+                    entries = list(it)
+            except OSError:
+                continue
+            for e in entries:
                 try:
-                    st = os.stat(path)
+                    if e.is_dir():
+                        if not e.name.startswith("."):
+                            stack.append(e.path)
+                        continue
+                    if schedule.is_schedule_file(e.name):
+                        st = e.stat()
+                        sched[e.path] = (st.st_mtime_ns, st.st_size)
+                        continue
+                    d = parse_note_date(e.name)
+                    if d is None:
+                        continue
+                    st = e.stat()
                 except OSError:
                     continue
                 # 같은 날짜 파일이 여러 개면 최근 수정된 것을 사용
                 if d not in found or st.st_mtime_ns > found[d][1]:
-                    found[d] = (path, st.st_mtime_ns, st.st_size)
+                    found[d] = (e.path, st.st_mtime_ns, st.st_size)
         return found, sched
 
     def refresh(self):
-        """변경된 날짜 목록을 반환."""
+        """폴더를 다시 읽어 바뀐 날짜를 pending 에 쌓는다 (알림은 publish)."""
         with self.lock:
             root = self.root
         found, sched = self._scan(root)
@@ -147,7 +160,7 @@ class NoteStore:
         changed = []
         with self.lock:
             if root != self.root:  # 스캔 도중 경로가 바뀜
-                return []
+                return
             for d, info in found.items():
                 if self.files.get(d) != info:
                     changed.append(d)
@@ -163,16 +176,18 @@ class NoteStore:
                     self.summary.pop(d, None)
                     self.blank.discard(d)
             self.files = found
+            self.pending.update(changed)
             if events is not None:
                 self.sched_files = sched
                 self.events = events
                 self.sched_changed = True
-        return changed
 
-    def pop_schedule_changed(self):
+    def pop_changes(self):
+        """-> (바뀐 날짜 iso 목록, 일정 바뀜 여부). 가져가면 비움"""
         with self.lock:
-            changed, self.sched_changed = self.sched_changed, False
-            return changed
+            dates = sorted(d.isoformat() for d in self.pending)
+            sched, self.pending, self.sched_changed = self.sched_changed, set(), False
+        return dates, sched
 
     def schedule(self):
         with self.lock:
@@ -222,10 +237,7 @@ class NoteStore:
             folder = os.path.join(root, f"{d.year:04d}.{d.month:02d}")
             os.makedirs(folder, exist_ok=True)
             path = os.path.join(folder, f"{d:%y%m%d} {WEEKDAYS[d.weekday()]}.md")
-        tmp = path + ".dogani.tmp"
-        with open(tmp, "w", encoding="utf-8", newline="") as f:
-            f.write(content)
-        os.replace(tmp, path)
+        atomic_write(path, content)
         self.refresh()
         return self.note(d)
 
@@ -258,10 +270,7 @@ class NoteStore:
             raise OSError("todo 경로가 지정되지 않았습니다")
         if os.path.exists(path) and base_mtime is not None and os.stat(path).st_mtime_ns // 1_000_000 != base_mtime:
             return None
-        tmp = path + ".dogani.tmp"
-        with open(tmp, "w", encoding="utf-8", newline="") as f:
-            f.write(content)
-        os.replace(tmp, path)
+        atomic_write(path, content)
         return self.sched_doc()
 
     def month(self, year, month):
@@ -271,6 +280,16 @@ class NoteStore:
                 for d, s in self.summary.items()
                 if d.year == year and d.month == month
             }
+
+
+def publish(store, hub):
+    """폴더를 다시 읽고 쌓인 변경을 접속자에게 알림 (감시 루프·저장 직후 공용)"""
+    store.refresh()
+    dates, sched = store.pop_changes()
+    if dates:
+        hub.broadcast("changed", {"dates": dates})
+    if sched:
+        hub.broadcast("schedule", {})
 
 
 # ---------------------------------------------------------------- clients / SSE
@@ -505,22 +524,16 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError
             try:
                 if path == "/note":
-                    d = dt.date.fromisoformat(body["date"])
-                    note = store.write(d, content, body.get("base_mtime"))
-                    event = ("changed", {"dates": [d.isoformat()]})
+                    note = store.write(dt.date.fromisoformat(body["date"]), content, body.get("base_mtime"))
                 elif path == "/sched-doc":
                     note = store.write_sched_doc(content, body.get("base_mtime"))
-                    event = ("schedule", {})
                 else:
                     return self._send_json({"error": "not found"}, 404)
             except OSError as e:
                 return self._send_json({"error": "write_failed", "message": str(e)}, 500)
             if note is None:
                 return self._send_json({"error": "conflict"}, 409)
-            if event[0] == "schedule":
-                store.refresh()
-                store.pop_schedule_changed()
-            hub.broadcast(*event)
+            publish(store, hub)
             return self._send_json(note)
         if path == "/note":
             d = dt.date.fromisoformat(qs.get("date", [dt.date.today().isoformat()])[0])
@@ -619,18 +632,10 @@ class ShareServer:
 
     def _watch_loop(self):
         while self.running:
-            changed = self.store.refresh()
-            if changed:
-                self.hub.broadcast("changed", {"dates": sorted(d.isoformat() for d in changed)})
-            if self.store.pop_schedule_changed():
-                self.hub.broadcast("schedule", {})
+            publish(self.store, self.hub)
             team = self.team
             if team:
-                changed = team.store.refresh()
-                if changed:
-                    team.hub.broadcast("changed", {"dates": sorted(d.isoformat() for d in changed)})
-                if team.store.pop_schedule_changed():
-                    team.hub.broadcast("schedule", {})
+                publish(team.store, team.hub)
             time.sleep(POLL_INTERVAL)
 
     def set_root(self, path):
