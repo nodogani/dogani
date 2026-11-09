@@ -96,7 +96,7 @@ def load_config():
     cfg["team"].pop("secret", None)   # 예전 HMAC 비밀키 (위조에 쓰일 수 있어 폐기)
     migrate_windows(cfg)
     if not cfg["name"]:
-        cfg["name"] = clean_name(os.environ.get("USERNAME") or socket.gethostname())
+        cfg["name"] = clean_name(socket.gethostname() or os.environ.get("USERNAME"))   # 처음엔 PC 이름
     return cfg
 
 
@@ -485,7 +485,7 @@ class Tray(QObject):
 
 # ---------------------------------------------------------------- dialogs (Windows 기본 위젯)
 class TeamDialog(QDialog):
-    """팀 참여 (호스트 주소 + 초대장 코드 + 이름)"""
+    """팀 참여 (호스트 주소 + 초대장 코드). 이름은 '내 이름'을 그대로 보냄"""
 
     def __init__(self, host="", name=""):
         super().__init__(None, Qt.WindowType.WindowStaysOnTopHint)
@@ -493,14 +493,15 @@ class TeamDialog(QDialog):
         form = QFormLayout()
         self.host = QLineEdit(host, placeholderText="예) 192.168.0.10  (관리자에게 받기)")
         self.code = QLineEdit(placeholderText="XXXX-XXXX-XXXX", maxLength=20)
-        self.name = QLineEdit(name, maxLength=NAME_MAX)
         form.addRow("호스트 주소", self.host)
         form.addRow("초대장 코드", self.code)
-        form.addRow("내 이름", self.name)
+        name_label = QLabel(f"{name}   (트레이 > 내 이름 에서 바꿈)")
+        name_label.setTextFormat(Qt.TextFormat.PlainText)
+        form.addRow("내 이름", name_label)
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(QLabel("초대장은 관리자가 사람마다 따로 만들어 줍니다. (15분 안에 한 번만 쓸 수 있음)\n"
-                                "PC 를 바꿨으면 관리자에게 '다시 초대'를 부탁하세요. 그때 이름은 예전 그대로 쓰입니다."))
+                                "PC 를 바꿨으면 관리자에게 '다시 초대'를 부탁하세요."))
         self.error = QLabel()
         self.error.setStyleSheet("color: #c0392b")
         layout.addWidget(self.error)
@@ -516,8 +517,6 @@ class TeamDialog(QDialog):
             return self.error.setText("호스트 주소를 입력하세요.")
         if not self.code.text().strip():
             return self.error.setText("초대장 코드를 입력하세요.")
-        if not clean_name(self.name.text()):
-            return self.error.setText("이름을 입력하세요.")
         msg = self.handler(self) if self.handler else None
         if msg:
             self.error.setText(msg)
@@ -1050,6 +1049,10 @@ class DoganiApp(QObject):
     def team_request(self, host, path, body):
         """대화상자에서 쓰는 동기 요청 → (성공 여부, 응답 또는 오류 문구)"""
         status, res = http_json(host, path, body, token=self.cfg["team"].get("token", ""), name=self.cfg["name"])
+        return self.team_request_result(host, status, res)
+
+    @staticmethod
+    def team_request_result(host, status, res):
         if status == 200:
             return True, res
         if status == 0:
@@ -1076,7 +1079,18 @@ class DoganiApp(QObject):
 
         def handler(d):
             host = normalize_server(d.host.text())
-            ok, res = self.team_request(host, "/api/team/join", {"code": d.code.text(), "name": d.name.text()})
+            name = self.cfg["name"]
+            while True:
+                status, res = http_json(host, "/api/team/join", {"code": d.code.text(), "name": name})
+                if status != 409 or res.get("error") != "name_taken":
+                    break
+                # 이름이 겹치면 그 자리에서 다른 이름을 물어 같은 초대장으로 다시 시도
+                name, ok = QInputDialog.getText(d, "이름이 겹침", res.get("message", "") + "\n\n팀에서 쓸 다른 이름:",
+                                                QLineEdit.EchoMode.Normal, name)
+                name = clean_name(name) if ok else ""
+                if not name:
+                    return "취소했습니다. (초대장은 15분 안에 다시 쓸 수 있음)"
+            ok, res = self.team_request_result(host, status, res)
             if not ok:
                 return res
             self.set_session(host, res)
@@ -1145,7 +1159,7 @@ class DoganiApp(QObject):
         name = clean_name(name) if ok else ""
         if not name or name == self.cfg["name"]:
             return
-        if self.in_team():
+        if self.in_team() and self.team_status != "logged_out":   # 로그인 풀렸으면 이 PC 이름만 바꿈
             ok, res = self.team_request(self.cfg["team"]["host"], "/api/team/profile", {"name": name})
             if not ok:
                 QMessageBox.warning(None, APP_NAME, res)

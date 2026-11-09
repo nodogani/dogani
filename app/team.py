@@ -5,7 +5,8 @@
   공용 노트·공용 일정은 호스트 PC 의 폴더(기본 %APPDATA%\\Dogani\\team\\notes)에 평범한 md 파일로 저장
   → 옵시디언으로 열 수 있고, 백업은 폴더 복사
 - 인증 (IT 회사가 아닌 사무실 수준):
-  * 팀 참여 = 호스트 주소 + 초대장 코드(사람마다 다름, 12자리, 한 번 쓰면 폐기, 15분 뒤 만료) + 이름
+  * 팀 참여 = 호스트 주소 + 초대장 코드(사람마다 다름, 12자리, 한 번 쓰면 폐기, 15분 뒤 만료).
+    이름은 따로 안 묻고 그 PC 의 '내 이름'(기본 PC 이름)을 씀. 다시 초대는 팀에 있던 이름 유지
   * 한 번 참여하면 PC 에 토큰을 저장해서 다시 묻지 않음. PC 를 바꾸면 호스트가 그 사람 자리로 다시 초대
     (다시 초대로 들어오면 예전 PC 의 토큰은 무효)
   * 초대장 코드를 5번 틀리면 그 IP 는 1분 동안 참여 금지
@@ -280,9 +281,10 @@ class TeamHost:
         return sorted(out, key=lambda i: i["left"])
 
     def join(self, ip, code, name):
-        """초대장 코드 (+ 새 팀원이면 이름) → 토큰. 성공하면 초대장은 폐기"""
+        """초대장 코드 + 그 PC 의 '내 이름' → 토큰. 성공하면 초대장은 폐기 (이름이 겹치면 초대장은 남음)"""
         self._limit(ip)
         code = normalize_invite(code)
+        name = clean_name(name)
         with self.lock:
             purged = self._purge()
             inv = self.data["invites"].get(code) if len(code) == INVITE_LEN else None
@@ -294,15 +296,15 @@ class TeamHost:
                         del self.data["invites"][code]
                         self._save()
                         raise TeamError("bad_code", "초대장 대상이 팀에 없습니다. 관리자에게 새 초대장을 받으세요.", 404)
-                    self._drop_invites(mid)
+                    self._drop_invites(mid)   # 이름은 팀에 있던 그대로 (새 PC 는 받아서 '내 이름'으로 씀)
                     iat = int(time.time()) + 1
                     m["min_iat"] = iat   # 예전 PC 의 토큰(같은 1초 것 포함)은 무효, 새 토큰만 통과
                 else:
-                    name = clean_name(name)
                     if not name:
-                        raise TeamError("bad_name", "이름을 입력하세요.")
+                        raise TeamError("bad_name", "이름이 비어 있습니다.")
                     if self._find_name(name):
-                        raise TeamError("name_taken", "이미 있는 이름입니다. 본인이면 관리자에게 '다시 초대'를 부탁하세요.", 409)
+                        raise TeamError("name_taken", f"'{name}' 은(는) 이미 팀에 있는 이름입니다. "
+                                        "본인이면 관리자에게 '다시 초대'를 부탁하세요.", 409)
                     mid = secrets.token_hex(4)
                     self.data["members"][mid] = {
                         "name": name, "admin": False, "min_iat": 0, "addr": "", "last_seen": 0,

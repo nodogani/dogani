@@ -70,7 +70,7 @@
 | `/api/schedule` | GET | 파싱된 일정 목록 |
 | `/api/sched-doc` | GET/POST | 일정 파일 원문 / 저장 |
 | `/api/team/hello` | GET | 호스트 확인 (인증 전) |
-| `/api/team/join` | POST | `{code, name}` → 토큰·공개키(`pub`). 초대장은 성공 시 폐기, 다시 초대면 `name` 무시 (5회 실패 시 IP 1분 잠금) |
+| `/api/team/join` | POST | `{code, name}` → 토큰·공개키(`pub`). `name` = 그 PC 의 '내 이름'(설정 `name`, 처음엔 PC 호스트명). 다시 초대면 `name` 무시하고 팀에 있던 이름 유지(새 PC 의 '내 이름'이 그걸로 바뀜). 새 팀원 이름이 겹치면 409 `name_taken`, 초대장은 남고 참여 창이 다른 이름을 물어 다시 시도. 초대장은 성공 시 폐기 (5회 실패 시 IP 1분 잠금) |
 | `/api/team/me?port=` | GET | 팀원 신호(20초 주기, 75초 안 = 접속 중) + 팀원 목록·비밀키 |
 | `/api/team/profile` | POST | 이름 변경 |
 | `/api/team/{info,events,note,month,schedule,sched-doc}` | | 개인 공간과 같은 형식, 팀원만 |
