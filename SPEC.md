@@ -21,8 +21,8 @@
 | `app/server.py` | 공유 서버(ThreadingHTTPServer, 스레드). `NoteStore`(폴더 감시·읽기·쓰기), `Hub`(SSE·접속자·차단), 라우팅 |
 | `app/team.py` | 팀 호스트(`TeamHost`: 팀원·초대장·공용 노트), 토큰(`TeamAuth`) |
 | `app/schedule.py` | 일정 파일 파서 |
-| `app/updater.py` | GitHub 최신 버전 태그 확인(`check`) / 받기(`stage`, 태그 zip 의 `app/` → `app.new`) |
-| `app/liveupdate.py` | exe: 실행 중 업데이트 확인만(트레이 표시, 재시작 안 함). 소스 실행: `devreload` 연결 |
+| `app/updater.py` | GitHub 최신 버전 태그 받기(`stage`, 태그 zip 의 `app/` → `app.new`) |
+| `app/liveupdate.py` | exe: 버전 표시만(실행 중 확인 없음). 소스 실행: `devreload` 연결 |
 | `app/devreload.py` | 개발 모드 파일 감시(ui → 새로고침, .py → 문법 확인 후 재시작) |
 | `app/deps.py` | exe 에 넣을 모듈 목록(받은 코드가 쓸 수 있는 import 범위) |
 | `app/ui/` | 오버레이 UI: `index.html`, `app.js`(노트·바·공간), `calendar.js`, `markdown.js`, `style.css`, `vendor/editor.js` |
@@ -93,7 +93,7 @@
 
 1. 배포 = GitHub 에 버전 태그(`vYY.MM.DD.NN`) push. 커밋·push 만으로는 안 나감. 태그의 `app/`(editor 제외)만 나감
 2. 모든 exe(나·동료 동일, 디스코드식): 켤 때 런처가 최신 태그 확인(5초 제한) → 새 버전이면 받아 `app.new` → `app` 교체 후 실행. 확인 실패면 지금 버전으로 실행
-3. 실행 중: 30초 뒤 + 1시간마다 확인만 → 트레이 버전 옆 "(재시작하면 적용)". 재시작은 사용자가
+3. 실행 중: 확인하지 않음. 업데이트는 켤 때 런처가 한 번 확인·적용
 4. 버전 비교 = 태그 문자열 비교 (형식 고정이라 시간순과 같음)
 5. 소스 실행(개발·테스트)은 업데이트 안 받음, 트레이 버전 = "마지막 태그 개발 중"
 6. exe 재빌드 필요: `deps.py` 에 새 라이브러리 / `launcher.py` 수정

@@ -3,7 +3,7 @@
 
 - 배포 = GitHub 에 버전 태그(v26.xx.xx.xx) push. 커밋·push 만으로는 안 나감.
 - 받는 쪽(exe, 나·동료 동일): 런처가 켤 때 GitHub 의 최신 태그를 확인해 새 버전이면 받아서 바로 적용.
-  실행 중에는 확인만 하고(트레이에 "재시작하면 적용") 재시작은 안 함.
+  실행 중에는 확인하지 않음.
 - 소스 실행(개발 PC)은 받지 않음.
 """
 import io
@@ -64,16 +64,6 @@ def latest_tag(timeout=5):
         return None
     names = [t.get("name", "") for t in tags if TAG_RE.match(t.get("name", ""))]
     return max(names) if names else None  # vYY.MM.DD.NN 은 문자열 정렬 = 시간순
-
-
-def check(timeout=5):
-    """"new" = 새 버전 있음, "latest" = 최신, None = 확인 못 함"""
-    if not FROZEN:
-        return None
-    tag = latest_tag(timeout)
-    if not tag:
-        return None
-    return "new" if tag > current_version().get("id", "") else "latest"
 
 
 def stage(timeout=20):
