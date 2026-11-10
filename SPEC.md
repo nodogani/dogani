@@ -27,7 +27,8 @@
 | `app/deps.py` | exe 에 넣을 모듈 목록(받은 코드가 쓸 수 있는 import 범위) |
 | `app/ui/` | 오버레이 UI: `index.html`, `app.js`(노트·바·공간), `calendar.js`, `markdown.js`, `style.css`, `vendor/editor.js` |
 | `app/editor/` | CodeMirror 6 라이브 프리뷰 편집기 소스 → `build.bat`(Node) → `ui/vendor/editor.js`. 배포 zip 제외 |
-| `build.bat` | PyInstaller 로 런처 exe 빌드, 기본 코드 `version.json` = 마지막 태그 |
+| `build.bat` | PyInstaller 로 런처 exe 빌드, 기본 코드 `version.json` = 마지막 태그. Inno Setup 6 있으면 `installer.iss` → `dist\dogani-setup.exe` |
+| `installer.iss` | 설치 파일: 사용자 단위(관리자 불필요) `%LOCALAPPDATA%\Programs\dogani`, 시작 메뉴·제거 항목, 선택: 자동 실행(HKCU Run `Dogani`, 기본 켬)·바탕화면. 실행 중이면(`DoganiMutex`) 닫으라고 안내. 제거 시 `%APPDATA%\Dogani` 남김 |
 
 ## 3. 데이터 형식
 
@@ -96,7 +97,8 @@
 3. 실행 중: 확인하지 않음. 업데이트는 켤 때 런처가 한 번 확인·적용
 4. 버전 비교 = 태그 문자열 비교 (형식 고정이라 시간순과 같음)
 5. 소스 실행(개발·테스트)은 업데이트 안 받음, 트레이 버전 = "마지막 태그 개발 중"
-6. exe 재빌드 필요: `deps.py` 에 새 라이브러리 / `launcher.py` 수정
+6. exe 재빌드 필요: `deps.py` 에 새 라이브러리 / `launcher.py` 수정 → 새 `dogani-setup.exe` 를 나눠 주고 덮어 설치
+7. 처음 나눠 주기 = `dogani-setup.exe` (폴더째 복사도 됨)
 
 ## 7. UI
 

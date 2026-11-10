@@ -13,7 +13,8 @@
 
 | 방식 | 설치 | 실행 |
 |---|---|---|
-| exe (Python 불필요, 권장) | `build.bat` 으로 빌드 후 `dist\Dogani\` 폴더째 복사 | `Dogani.exe` |
+| 설치 파일 (Python 불필요, 권장) | `dogani-setup.exe` 실행 (관리자 권한 불필요, 다시 실행하면 덮어 설치) | 시작 메뉴 `dogani` |
+| exe 폴더 | `build.bat` 으로 빌드 후 `dist\dogani\` 폴더째 복사 | `dogani.exe` |
 | 스크립트 (Python 3.10+) | `app\install.bat` | `app\run.bat` |
 
 - 첫 실행 시 todo 폴더 선택 창이 뜹니다. 동료 노트만 볼 거라면 취소해도 됩니다. (`run.bat --dir "D:\Obsidian\Daily" --port 8765 --add 192.168.0.10` 로 지정 가능)

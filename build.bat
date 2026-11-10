@@ -19,8 +19,19 @@ python -m PyInstaller --noconfirm --windowed --name dogani --distpath dist --wor
 rem 용량 줄이기: 한국어/영어 외 Qt 번역 파일 삭제
 powershell -NoProfile -Command "Get-ChildItem 'dist\dogani\_internal\PySide6\translations' -Recurse -File | Where-Object { $_.Name -notmatch '(_ko|_en|ko\.pak|en-US\.pak)' } | Remove-Item -Force"
 
+rem 설치 파일: Inno Setup 6 이 있으면 dist\dogani-setup.exe 생성 (설치: winget install JRSoftware.InnoSetup)
+set "ISCC="
+for %%P in ("%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" "%ProgramFiles%\Inno Setup 6\ISCC.exe") do if exist %%P set "ISCC=%%~P"
+set "VER="
+for /f %%T in ('git describe --tags --abbrev^=0 2^>nul') do set "VER=%%T"
+if not defined VER set "VER=dev"
 echo.
-echo 완료: dist\dogani 폴더를 통째로 복사해서 사용하세요.
+if defined ISCC (
+    "%ISCC%" /Q /DAppVer=%VER% installer.iss || goto :error
+    echo 완료: dist\dogani-setup.exe 를 나눠 주세요. ^(폴더째 쓰려면 dist\dogani^)
+) else (
+    echo Inno Setup 6 이 없어 설치 파일은 건너뜀. dist\dogani 폴더를 통째로 복사해서 사용하세요.
+)
 pause
 exit /b 0
 

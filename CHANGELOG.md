@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## (다음 태그에 포함)
+
+### 배포
+- 설치 파일 `dogani-setup.exe` (Inno Setup 6, `installer.iss`): 사용자 단위 설치·시작 메뉴·제거 항목·자동 실행 선택. `build.bat` 이 Inno Setup 있으면 같이 만듦
+
 ## v26.11.10.04 (2026-11-10)
 
 ### 창 위치
