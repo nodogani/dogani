@@ -10,7 +10,7 @@
 
   const $ = (id) => document.getElementById(id);
   const MD = window.ObsidianMarkdown;
-  const CAL = window.DoganiCalendar;
+  const CAL = window.doganiCalendar;
   const { WD, pad, iso, parseISO, addMonths } = CAL;
   const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 
@@ -63,7 +63,7 @@
     blocked: "상대방이 접속을 차단했습니다.",
     team_only: "팀원에게만 공유하는 노트입니다. (트레이 > 팀스페이스 > 팀 참여)",
     not_member: "팀 로그인이 필요합니다. (트레이 > 팀스페이스)",
-    client_only: "접속 키가 맞지 않습니다. (Dogani 버전 확인)",
+    client_only: "접속 키가 맞지 않습니다. (dogani 버전 확인)",
     conflict: "그 사이 다른 곳(옵시디언·다른 팀원)에서 수정되어 저장하지 않았습니다. 다시 불러옵니다.",
     read_only: "편집 권한이 없습니다.",
     write_failed: "저장에 실패했습니다.",
@@ -136,7 +136,7 @@
     try {
       state.ownEvents = (await api("/schedule")).events || [];
     } catch (e) {
-      return; // 예전 버전 Dogani(일정 API 없음) 이거나 연결 끊김: 기존 것 유지
+      return; // 예전 버전 dogani(일정 API 없음) 이거나 연결 끊김: 기존 것 유지
     }
     rebuildSched();
   }
@@ -429,7 +429,7 @@
   }
 
   // ------------------------------------------------------------ nav (네비게이션 바 + 공간 메뉴)
-  const GROUPS = [["team", "공용"], ["me", "개인"], ["member", ""], ["other", "주소로 추가"]];
+  const GROUPS = [["team", "팀 볼트"], ["me", "내 볼트"]];
 
   function renderNav(cfg) {
     const sp = state.space;
@@ -437,7 +437,7 @@
     const dot = $("status-dot");
     for (const s of ["online", "paused", "blocked"]) dot.classList.toggle(s, (sp.status === "team_only" ? "blocked" : sp.status) === s);
     $("space-name").textContent = sp.name;
-    $("nav").title = `${sp.kind === "team" ? "공용 공간" : sp.kind === "me" ? "내 노트" : sp.server} · 드래그해서 이동`;
+    $("nav").title = `${sp.kind === "team" ? "팀 볼트" : "내 볼트"} · 드래그해서 이동`;
     renderMenu(cfg);
     reportNavSize();
   }
@@ -448,10 +448,10 @@
     for (const [group, title] of GROUPS) {
       const items = state.spaces.filter((s) => s.group === group);
       if (group === "team" && !items.length) {
-        html += `<div class="sm-title">공용</div>`;
+        html += `<div class="sm-title">팀 볼트</div>`;
         html += `<button class="sm-item sm-action" data-action="join_team"><span class="sm-glyph">+</span><span class="sm-name">팀 참여하기...</span></button>`;
         if ((cfg || {}).teamState === "none") {
-          html += `<button class="sm-item sm-action" data-action="start_host"><span class="sm-glyph">⌂</span><span class="sm-name">새 팀 만들기 (이 PC 가 호스트)</span></button>`;
+          html += `<button class="sm-item sm-action" data-action="start_host"><span class="sm-glyph">⌂</span><span class="sm-name">새 팀 만들기 (이 PC 가 호스트)...</span></button>`;
         }
         continue;
       }
@@ -460,14 +460,14 @@
       for (const s of items) {
         const st = s.status === "team_only" ? "blocked" : s.status;
         html += `<button class="sm-item${s.key === cur ? " active" : ""}" data-key="${esc(s.key)}"${s.disabled ? " disabled" : ""}>` +
-          `<span class="sm-name">${esc(s.name)}${s.kind === "me" ? ' <em>나</em>' : ""}</span>` +
+          `<span class="sm-name">${esc(s.name)}</span>` +
           (s.sub ? `<span class="sm-sub">${esc(s.sub)}</span>` : "") +
           `<span class="dot ${st}"></span></button>`;
       }
     }
     html += `<div class="sm-sep"></div>`;
     html += `<button class="sm-item sm-action" data-action="rename"><span class="sm-glyph">✎</span><span class="sm-name">내 이름 바꾸기</span></button>`;
-    html += `<button class="sm-item sm-action" data-action="add_server"><span class="sm-glyph">+</span><span class="sm-name">주소로 노트 추가...</span></button>`;
+    html += `<button class="sm-item sm-action" data-action="browse_dir"><span class="sm-glyph">+</span><span class="sm-name">볼트 열기...</span></button>`;
     $("space-menu").innerHTML = html;
   }
 

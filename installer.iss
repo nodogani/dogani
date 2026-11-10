@@ -1,5 +1,5 @@
 ; dogani 설치 파일 (Inno Setup 6). build.bat 이 dist\dogani 를 만든 뒤 iscc 로 컴파일 → dist\dogani-setup.exe
-; 사용자 단위 설치(관리자 권한 없음). 설정·데이터(%APPDATA%\Dogani)는 제거해도 남김
+; 사용자 단위 설치(관리자 권한 없음). 설정·데이터(%APPDATA%\dogani)는 제거해도 남김
 #ifndef AppVer
   #define AppVer "dev"
 #endif
@@ -45,8 +45,8 @@ Name: "{userprograms}\dogani"; Filename: "{app}\dogani.exe"
 Name: "{userdesktop}\dogani"; Filename: "{app}\dogani.exe"; Tasks: desktopicon
 
 [Registry]
-; 앱의 트레이 '자동 실행' 과 같은 값(HKCU Run\Dogani)
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Dogani"; ValueData: """{app}\dogani.exe"""; Tasks: autostart; Flags: uninsdeletevalue
+; 앱의 트레이 '자동 실행' 과 같은 값(HKCU Run\dogani)
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "dogani"; ValueData: """{app}\dogani.exe"""; Tasks: autostart; Flags: uninsdeletevalue
 
 [Run]
 Filename: "{app}\dogani.exe"; Description: "dogani 실행"; Flags: nowait postinstall skipifsilent

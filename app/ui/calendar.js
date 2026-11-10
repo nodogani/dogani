@@ -232,7 +232,7 @@
     return evs.map(chip).join("");
   }
 
-  window.DoganiCalendar = {
+  window.doganiCalendar = {
     WD, pad, iso, parseISO, addDays, addMonths,
     index, isOff, nextWorkday, renderMonth, fitCells, dayEvents,
   };

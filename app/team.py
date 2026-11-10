@@ -1,19 +1,18 @@
 """
 팀스페이스 (공용 공간 + 팀원 식별)
 
-- 팀 호스트: 팀원 중 한 사람의 Dogani 가 맡는다 (켜 두는 시간이 긴 PC 추천).
-  공용 노트·공용 일정은 호스트 PC 의 폴더(기본 %APPDATA%\\Dogani\\team\\notes)에 평범한 md 파일로 저장
-  → 옵시디언으로 열 수 있고, 백업은 폴더 복사
+- 팀 호스트: 팀원 중 한 사람의 dogani 가 맡는다 (켜 두는 시간이 긴 PC 추천).
+  팀 볼트 = 호스트 PC 의 폴더 하나 (개인 볼트와 같은 형식, vault.py). 노트·일정은 평범한 md 파일
+  팀 설정(이름·팀원)은 볼트의 .dogani/team.json, 서명 키·초대장은 호스트 PC 의 %APPDATA%\\dogani\\team\\<볼트id>.json
+  (볼트 폴더가 복사·동기화돼도 비밀값은 따라가지 않음)
 - 인증 (IT 회사가 아닌 사무실 수준):
   * 팀 참여 = 호스트 주소 + 초대장 코드(사람마다 다름, 12자리, 한 번 쓰면 폐기, 15분 뒤 만료).
     이름은 따로 안 묻고 그 PC 의 '내 이름'(기본 PC 이름)을 씀. 다시 초대는 팀에 있던 이름 유지
   * 한 번 참여하면 PC 에 토큰을 저장해서 다시 묻지 않음. PC 를 바꾸면 호스트가 그 사람 자리로 다시 초대
     (다시 초대로 들어오면 예전 PC 의 토큰은 무효)
   * 초대장 코드를 5번 틀리면 그 IP 는 1분 동안 참여 금지
-  * 토큰 = 팀원ID.발급시각.Ed25519 서명. 서명 키(개인키)는 호스트 PC 에만 있고, 팀원 PC 들은
-    공개키만 받아서 토큰을 직접 검증한다 → 호스트가 꺼져 있어도 "팀원에게만 공유" 가 동작하고,
-    팀원(또는 내보낸 사람)이 공개키로 토큰을 위조할 수는 없다
-  * 내보내기 = 팀원 목록에서 삭제, 다시 초대로 참여 = min_iat 올림. 둘 다 팀원 목록과 함께 각 PC 로 전파
+  * 토큰 = 팀원ID.발급시각.Ed25519 서명. 서명 키(개인키)는 호스트 PC 에만 있고 호스트가 직접 검증
+  * 내보내기 = 팀원 목록에서 삭제, 다시 초대로 참여 = min_iat 올림
 """
 import datetime as dt
 import json
@@ -24,6 +23,7 @@ import time
 from functools import lru_cache
 
 import ed25519
+import vault
 
 INVITE_TTL = 15 * 60    # 초대장 유효 시간(초)
 INVITE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # 헷갈리는 0/O, 1/I 제외
@@ -70,39 +70,6 @@ def parse_token(pub_hex, token):
     return (mid, iat) if ok else None
 
 
-class TeamAuth:
-    """팀원 PC(호스트 아님)에서 접속자 토큰 검증용. 공개키·팀원 목록은 호스트에서 받아 온다."""
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.pub = ""
-        self.joined = False
-        self.members = {}   # id -> (이름, min_iat) (모르면 빈 dict = 목록 확인 안 함)
-
-    def update(self, pub, members, joined=None):
-        with self.lock:
-            self.pub = pub or ""
-            # 팀에 들어 있는데 공개키가 아직 없으면(업데이트 직후·로그인 풀림) 아무 토큰도 통과 못 함 = 닫힌 쪽
-            self.joined = bool(pub) if joined is None else bool(joined)
-            self.members = {m["id"]: (m["name"], m.get("min_iat", 0)) for m in members or []}
-
-    @property
-    def active(self):
-        return self.joined
-
-    def verify(self, token):
-        """토큰 → (id, 이름) 또는 None. 내보낸 사람(목록에 없음)·다시 초대 이전 토큰은 거부"""
-        with self.lock:
-            pub, members = self.pub, dict(self.members)
-        parsed = parse_token(pub, token) if pub and _shape_ok(token, members) else None
-        if not parsed:
-            return None
-        mid, iat = parsed
-        if members and (mid not in members or iat < members[mid][1]):
-            return None
-        return mid, members.get(mid, ("", 0))[0]
-
-
 # ---------------------------------------------------------------- invite
 def normalize_invite(code):
     """입력한 초대장 코드 → 대문자·구분자 제거 (XXXX-XXXX-XXXX 로 보여 주고, 띄어쓰기·소문자도 받음)"""
@@ -128,38 +95,48 @@ class TeamError(Exception):
 
 # ---------------------------------------------------------------- host
 class TeamHost:
-    """팀 호스트 데이터: team.json(팀원·서명 키·초대장) + notes 폴더(공용 노트·일정)"""
+    """팀 볼트 + 팀 데이터: 볼트/.dogani/team.json(이름·팀원) + 키 파일(서명 키·초대장, 이 PC 에만)"""
 
-    def __init__(self, folder, owner_name):
+    PRIVATE = ("sign_key", "invites")   # 볼트에 두지 않는 값
+
+    def __init__(self, root, key_dir, owner_name, legacy_dir=None):
         from server import Hub, NoteStore  # 순환 import 방지
         self.lock = threading.Lock()
-        self.folder = folder
-        self.path = os.path.join(folder, "team.json")
-        self.notes_dir = os.path.join(folder, "notes")
-        os.makedirs(self.notes_dir, exist_ok=True)
-        self.data = self._load()
+        self.root = self.notes_dir = root
+        meta = vault.open_vault(root)
+        self.path = os.path.join(vault.meta_dir(root), "team.json")
+        self.key_path = os.path.join(key_dir, f"{meta['id']}.json")
+        self.data = self._load(legacy_dir)
         if self.data.pop("_dirty", False):   # 새 서명 키는 바로 저장 (안 그러면 재시작마다 키가 바뀜)
             self._save()
         self.pub = public_key(self.data["sign_key"])
         self.fails = {}   # ip -> [횟수, 잠금 해제 시각]
-        seed = os.path.join(self.notes_dir, "일정.md")
-        if not os.path.exists(seed):
-            with open(seed, "w", encoding="utf-8") as f:
+        if not any(f.endswith("일정.md") for f in os.listdir(root)):
+            with open(os.path.join(root, "일정.md"), "w", encoding="utf-8") as f:
                 f.write(SCHEDULE_SEED)
         self.store = NoteStore()
-        self.store.set_root(self.notes_dir)
+        self.store.set_root(root)
         self.store.refresh()
         self.store.pop_changes()   # 처음 읽은 것은 알릴 필요 없음
         self.hub = Hub()
         self.owner_id = self._ensure_owner(owner_name)
 
     # -- storage
-    def _load(self):
-        try:
-            with open(self.path, encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            data = {}
+    def _load(self, legacy_dir):
+        def read(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    return json.load(f)
+            except (OSError, ValueError):
+                return None
+        team, keys = read(self.path), read(self.key_path)
+        data = {**(team or {}), **(keys or {})}
+        legacy = os.path.join(legacy_dir, "team.json") if legacy_dir else ""
+        if team is None and keys is None and legacy and os.path.exists(legacy):
+            # v26.11.10 이전: %APPDATA%\dogani\team\team.json 하나에 다 있었음 → 나눠 저장, 예전 파일은 이름만 바꿈
+            data = read(legacy) or {}
+            data["_dirty"] = True
+            data["_legacy"] = legacy
         data.setdefault("name", "팀 공용")
         # 예전 HMAC 비밀키는 팀원 PC 에 퍼져 있어서 위조에 쓰일 수 있음 → 버리고 서명 키로 교체
         # (예전 토큰은 모두 무효, 팀원은 초대장으로 한 번 다시 참여)
@@ -178,10 +155,15 @@ class TeamHost:
         return data
 
     def _save(self):
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.path)
+        legacy = self.data.pop("_legacy", None)
+        # 키 파일 먼저 (볼트만 저장되고 키가 없으면 다음 실행에 새 키 = 모든 토큰 무효)
+        vault.write_json(self.key_path, {k: self.data[k] for k in self.PRIVATE})
+        vault.write_json(self.path, {k: v for k, v in self.data.items() if k not in self.PRIVATE})
+        if legacy:
+            try:
+                os.replace(legacy, legacy + ".migrated")
+            except OSError:
+                pass
 
     @property
     def name(self):

@@ -1,5 +1,5 @@
 """개발 모드(소스로 실행)에서 파일을 저장하면 바로 반영.
-  ui/ 파일 → 열린 창 새로고침,  .py 파일 → Dogani 재시작."""
+  ui/ 파일 → 열린 창 새로고침,  .py 파일 → dogani 재시작."""
 import os
 
 from PySide6.QtCore import QObject, QTimer, Signal

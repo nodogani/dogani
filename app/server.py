@@ -1,9 +1,9 @@
 """
-내 노트 공유 서버 (dogani.py 안에서 스레드로 실행)
+노트 서버 (dogani.py 안에서 스레드로 실행)
 
-- 옵시디언 데일리 노트 폴더(YYMMDD 요일.md)를 감시하다가 변경되면 SSE로 접속자에게 푸시
-- HTTP API (사내망 전용). 다른 사람은 읽기 전용, 같은 PC(나)에서 온 요청만 편집 가능
-- 공유 일시 중지 중에도 나는 계속 보고 편집할 수 있다
+- 볼트 폴더(데일리 노트 YYMMDD 요일.md + 일정 파일)를 감시하다가 변경되면 SSE 로 창에 푸시
+- 개인 볼트 /api/* : 같은 PC(나)에서 온 요청만 (남에게 공유하지 않음)
+- 팀 볼트 /api/team/* : 이 PC 가 팀 호스트일 때 팀원(토큰)에게 공개, 팀원 모두 편집
 """
 import datetime as dt
 import json
@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import schedule
 
-from team import NAME_MAX, TeamAuth, TeamError
+from team import NAME_MAX, TeamError
 
 POLL_INTERVAL = 1.0      # 파일 변경 감시 주기(초)
 HEARTBEAT_INTERVAL = 15  # SSE keep-alive 주기(초)
@@ -28,11 +28,18 @@ FILE_PATTERNS = [
     (re.compile(r"^(\d{2})(\d{2})(\d{2})(?:[\s_].*)?\.md$", re.I), lambda m: (2000 + int(m[1]), int(m[2]), int(m[3]))),
     (re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[\s_].*)?\.md$", re.I), lambda m: (int(m[1]), int(m[2]), int(m[3]))),
 ]
-# Dogani 프로그램 식별용 헤더 (보안 인증이 아니라 "브라우저로 그냥 열람"을 막는 용도)
-KEY_HEADER = "X-Dogani-Key"
-HOST_HEADER = "X-Dogani-Host"
-TOKEN_HEADER = "X-Dogani-Token"   # 팀원 토큰 (team.py)
-USER_HEADER = "X-Dogani-User"     # 표시 이름 (URL 인코딩)
+# dogani 프로그램 식별용 헤더 (보안 인증이 아니라 "브라우저로 그냥 열람"을 막는 용도)
+KEY_HEADER = "X-dogani-Key"
+
+
+def _web_origin(headers):
+    """오버레이(dogani:// 스킴) 가 아닌 웹페이지에서 온 요청인지"""
+    return (headers.get("Origin") or "").lower().startswith(("http:", "https:"))
+
+
+HOST_HEADER = "X-dogani-Host"
+TOKEN_HEADER = "X-dogani-Token"   # 팀원 토큰 (team.py)
+USER_HEADER = "X-dogani-User"     # 표시 이름 (URL 인코딩)
 CLIENT_KEY = "dogani-client-v1"
 TASK_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+\[(.)\]")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
@@ -294,75 +301,28 @@ def publish(store, hub):
 
 # ---------------------------------------------------------------- clients / SSE
 class Hub:
-    """SSE 구독자 관리 + 접속 IP 기록 + 차단 목록."""
+    """SSE 구독자 관리 (개인 볼트 창 / 팀 볼트 팀원)"""
 
-    def __init__(self, blocked=()):
+    def __init__(self):
         self.lock = threading.Lock()
         self.subscribers = []  # (ip, queue)
-        self.clients = {}      # ip -> {"active", "last_seen", "host", "user"}  (나 자신은 기록 안 함)
-        self.blocked = set(blocked)
 
-    def _client(self, ip):
-        return self.clients.setdefault(ip, {"active": 0, "last_seen": 0, "host": "", "user": ""})
-
-    def subscribe(self, ip, host="", record=True, user=""):
+    def subscribe(self, ip):
         q = queue.Queue()
         with self.lock:
             self.subscribers.append((ip, q))
-            if record:
-                c = self._client(ip)
-                c["active"] += 1
-                c["last_seen"] = time.time()
-                if host:
-                    c["host"] = host
-                if user:
-                    c["user"] = user
         return q
 
     def unsubscribe(self, ip, q):
         with self.lock:
             self.subscribers = [s for s in self.subscribers if s[1] is not q]
-            c = self.clients.get(ip)
-            if c:
-                c["active"] = max(0, c["active"] - 1)
-                c["last_seen"] = time.time()
 
-    def touch(self, ip, host="", user=""):
-        with self.lock:
-            c = self._client(ip)
-            c["last_seen"] = time.time()
-            if host:
-                c["host"] = host
-            if user:
-                c["user"] = user
-
-    def is_blocked(self, ip):
-        with self.lock:
-            return ip in self.blocked
-
-    def block(self, ip):
-        """차단 목록에 넣고 현재 연결을 끊는다."""
-        with self.lock:
-            self.blocked.add(ip)
-            targets = [q for i, q in self.subscribers if i == ip]
-        for q in targets:
-            q.put(None)
-
-    def unblock(self, ip):
-        with self.lock:
-            self.blocked.discard(ip)
-
-    def broadcast(self, event, data_for):
-        """data_for: dict 또는 ip -> dict 함수 (접속자마다 다른 내용을 보낼 때)."""
+    def broadcast(self, event, data):
         with self.lock:
             targets = list(self.subscribers)
-        for ip, q in targets:
-            data = data_for(ip) if callable(data_for) else data_for
-            q.put(f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n")
-
-    def snapshot(self):
-        with self.lock:
-            return {ip: dict(c) for ip, c in self.clients.items()}, set(self.blocked)
+        msg = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+        for _, q in targets:
+            q.put(msg)
 
 
 class Ctx:
@@ -377,7 +337,7 @@ class Ctx:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Dogani/1.0"
+    server_version = "dogani/1.0"
     share: "ShareServer" = None
 
     def log_message(self, *args):
@@ -394,6 +354,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_OPTIONS(self):
+        if _web_origin(self.headers):   # 웹페이지 사전 요청에는 CORS 허용 헤더를 주지 않음
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -404,9 +369,10 @@ class Handler(BaseHTTPRequestHandler):
     def _check(self):
         """공통 접속 검사. 통과하면 Ctx, 아니면 응답을 보내고 None."""
         ip = self.client_address[0]
-        # Dogani 프로그램만 접속 허용 (웹브라우저로 주소만 쳐서 보는 것을 막음)
-        if self.headers.get(KEY_HEADER) != CLIENT_KEY:
-            self._send_json({"error": "client_only", "message": "Dogani 로만 볼 수 있습니다."}, 403)
+        # dogani 프로그램만 접속 허용 (웹브라우저로 주소만 쳐서 보는 것을 막음)
+        # 웹페이지에서 온 요청(Origin 이 http/https) 은 키가 맞아도 거부 → 브라우저 탭이 127.0.0.1 로 노트를 읽는 것 방지
+        if self.headers.get(KEY_HEADER) != CLIENT_KEY or _web_origin(self.headers):
+            self._send_json({"error": "client_only", "message": "dogani 로만 볼 수 있습니다."}, 403)
             return None
         share = self.share
         owner = share.is_owner(ip)
@@ -414,18 +380,11 @@ class Handler(BaseHTTPRequestHandler):
         user = unquote(self.headers.get(USER_HEADER, ""))[:NAME_MAX]
         token = self.headers.get(TOKEN_HEADER, "")
         member = None
-        if token:
-            if share.team:   # 내가 팀 호스트면 직접 확인 (내보낸 사람·다시 초대도 바로 반영)
-                mid = share.team.member(token)
-                if mid:
-                    member = (mid, next((m["name"] for m in share.team.members() if m["id"] == mid), user))
-            else:
-                member = share.auth.verify(token)
-            if member and not member[1]:
-                member = (member[0], user)
-        if not owner and share.hub.is_blocked(ip):
-            self._send_json({"error": "blocked"}, 403)
-            return None
+        team = share.team
+        if token and team:   # 팀 호스트만 토큰을 확인 (내보낸 사람·다시 초대도 바로 반영)
+            mid = team.member(token)
+            if mid:
+                member = (mid, next((m["name"] for m in team.members() if m["id"] == mid), user))
         return Ctx(ip, host, owner, user, member)
 
     def _body(self):
@@ -461,23 +420,18 @@ class Handler(BaseHTTPRequestHandler):
         except (KeyError, ValueError, TypeError, AttributeError):
             self._send_json({"error": "bad request"}, 400)
 
-    # ------------------------------------------------------------ 개인 공간 (내 노트)
+    # ------------------------------------------------------------ 개인 볼트 (이 PC 에서만)
     def _personal(self, method, path, qs, ctx):
         share = self.share
         if not ctx.owner:
-            share.hub.touch(ctx.ip, ctx.host, ctx.member[1] if ctx.member else "")
+            return self._send_json({"error": "private", "message": "개인 볼트는 공유하지 않습니다."}, 403)
         if path == "/info":
-            return self._send_json({"app": "Dogani", "name": share.name, "pc": share.pc_name,
+            return self._send_json({"app": "dogani", "name": share.name, "pc": share.pc_name,
                                     "today": dt.date.today().isoformat(), "kind": "personal",
-                                    "paused": share.paused and not ctx.owner, "writable": ctx.owner})
-        # 팀원에게만 공유: 팀에 들어 있고 설정이 켜져 있으면 팀원 토큰이 있어야 볼 수 있다
-        if not ctx.owner and share.team_only and (share.auth.active or share.team) and not ctx.member:
-            return self._send_json({"error": "team_only"}, 403)
+                                    "paused": False, "writable": True})
         if path == "/events":
-            return self._stream(share.hub, ctx, lambda: share.paused and not ctx.owner, record=not ctx.owner)
-        if share.paused and not ctx.owner:
-            return self._send_json({"error": "paused"}, 503)
-        self._space(method, path, qs, share.store, share.hub, writable=ctx.owner)
+            return self._stream(share.hub, ctx)
+        self._space(method, path, qs, share.store, share.hub, writable=True)
 
     # ------------------------------------------------------------ 팀 공간
     def _team(self, method, path, qs, ctx):
@@ -490,15 +444,13 @@ class Handler(BaseHTTPRequestHandler):
             res.update(pub=team.pub, team=team.name)
             return self._send_json(res)
         if path == "/hello":   # 참여 전에 주소가 맞는지 확인용
-            return self._send_json({"app": "Dogani", "team": team.name, "host": self.share.name})
+            return self._send_json({"app": "dogani", "team": team.name, "host": self.share.name})
         mid = ctx.member[0] if ctx.member else (team.owner_id if ctx.owner else None)
         if not mid:
             return self._send_json({"error": "not_member", "message": "팀원만 볼 수 있습니다."}, 401)
         if path == "/me":
-            # 팀원 PC 가 주기적으로 보내는 신호: 내 노트 주소를 알리고 팀원 목록·공개키를 받는다
-            port = int(qs.get("port", ["0"])[0] or 0)
-            ip = self.share.ip if ctx.owner else ctx.ip
-            team.touch(mid, f"{ip}:{port}" if port else "")
+            # 팀원 PC 가 주기적으로 보내는 신호 (접속 중 표시) → 팀원 목록을 받는다
+            team.touch(mid, "")
             members = team.members()
             me = next((m for m in members if m["id"] == mid), None)
             return self._send_json({"me": me, "members": members, "pub": team.pub, "team": team.name})
@@ -507,10 +459,10 @@ class Handler(BaseHTTPRequestHandler):
             name = team.update_profile(mid, body.get("name"))
             return self._send_json({"name": name})
         if path == "/info":
-            return self._send_json({"app": "Dogani", "name": team.name, "kind": "team", "paused": False,
+            return self._send_json({"app": "dogani", "name": team.name, "kind": "team", "paused": False,
                                     "writable": True, "today": dt.date.today().isoformat()})
         if path == "/events":
-            return self._stream(team.hub, ctx, lambda: False, record=False)
+            return self._stream(team.hub, ctx)
         self._space(method, path, qs, team.store, team.hub, writable=True)
 
     # ------------------------------------------------------------ 노트 공간 공통 (개인·팀)
@@ -548,15 +500,15 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send_json({"error": "not found"}, 404)
 
-    def _stream(self, hub, ctx, paused, record):
+    def _stream(self, hub, ctx):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        q = hub.subscribe(ctx.ip, ctx.host, record=record, user=ctx.member[1] if ctx.member else "")
+        q = hub.subscribe(ctx.ip)
         try:
-            hello = json.dumps({"paused": paused()})
+            hello = json.dumps({"paused": False})
             self.wfile.write(f"retry: 3000\nevent: hello\ndata: {hello}\n\n".encode("utf-8"))
             self.wfile.flush()
             while not self.server.stopping:
@@ -564,8 +516,6 @@ class Handler(BaseHTTPRequestHandler):
                     msg = q.get(timeout=HEARTBEAT_INTERVAL)
                 except queue.Empty:
                     msg = ": ping\n\n"
-                if msg is None:  # 차단됨
-                    break
                 self.wfile.write(msg.encode("utf-8"))
                 self.wfile.flush()
         except (OSError, ConnectionError):
@@ -592,20 +542,17 @@ def local_ip():
 
 
 class ShareServer:
-    """내 노트 HTTP 서버 + 폴더 감시. start() 가 포트를 못 열면 OSError."""
+    """HTTP 서버 + 폴더 감시 (개인 볼트 + 팀 호스트면 팀 볼트). start() 가 포트를 못 열면 OSError."""
 
-    def __init__(self, port, todo_dir, paused=False, blocked=(), name=""):
+    def __init__(self, port, vault_dir, name=""):
         self.port = port
         self.store = NoteStore()
-        self.store.set_root(todo_dir)
-        self.hub = Hub(blocked)
-        self.paused = paused
+        self.store.set_root(vault_dir)
+        self.hub = Hub()
         self.ip = local_ip()
         self.pc_name = socket.gethostname()
         self.name = name or self.pc_name   # 표시 이름 (트레이 > 내 이름)
         self.team = None          # 팀 호스트면 TeamHost
-        self.auth = TeamAuth()    # 팀원이면 접속자 토큰 검증용
-        self.team_only = True     # 팀에 들어 있으면 팀원에게만 공유
         self.running = False
         self.httpd = None
 
@@ -614,7 +561,7 @@ class ShareServer:
         return f"{self.ip}:{self.port}"
 
     def is_owner(self, ip):
-        """같은 PC 에서 온 요청 = 나 (편집 허용, 공유 일시 중지·차단 무시)."""
+        """같은 PC 에서 온 요청 = 나 (개인 볼트는 나만)."""
         return ip in ("127.0.0.1", "::1", self.ip)
 
     def start(self):
@@ -641,7 +588,3 @@ class ShareServer:
     def set_root(self, path):
         self.store.set_root(path)
         self.hub.broadcast("reload", {})
-
-    def set_paused(self, paused):
-        self.paused = paused
-        self.hub.broadcast("status", lambda ip: {"paused": paused and not self.is_owner(ip)})

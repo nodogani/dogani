@@ -1,10 +1,10 @@
 """
-dogani - 사내망 todo 실시간 공유 (서버 + 뷰어 통합)
+dogani - 볼트(폴더) 단위 할일·일정 오버레이 + 사내망 팀 볼트
 
-- 화면: 네비게이션 바 하나 + 할일 창 + 달력 창. 바의 이름을 누르면 공간(공용/개인)을 고른다
-- 개인 공간: 내 노트(todo 폴더를 공유 서버로 열고 바로 편집) / 팀원·다른 사람 노트(읽기 전용)
-- 공용 공간: 팀 호스트 PC 에 있는 공용 노트·공용 일정 (팀원 모두 편집). team.py 참고
-- 시스템 트레이(Win32 기본 메뉴)로 표시 / 이름 / 팀 / 공유 / 접속자 / 경로 / 자동 실행 / 종료
+- 화면: 네비게이션 바 하나 + 할일 창 + 달력 창. 바의 이름을 누르면 공간(팀 볼트/내 볼트)을 고른다
+- 내 볼트: 이 PC 의 폴더 하나 (볼트 열기로 바꿈, 남에게 공유 안 함). vault.py 참고
+- 팀 볼트: 팀 호스트 PC 의 볼트 (팀원 모두 편집). team.py 참고
+- 시스템 트레이(Win32 기본 메뉴)로 표시 / 이름 / 팀 / 볼트 / 자동 실행 / 종료
 """
 import argparse
 import ctypes
@@ -33,41 +33,35 @@ from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFileDia
                                QLabel, QLineEdit, QMessageBox, QVBoxLayout, QWidget)
 
 import liveupdate
+import vault
 from server import CLIENT_KEY, HOST_HEADER, KEY_HEADER, TOKEN_HEADER, USER_HEADER, ShareServer
 from team import NAME_MAX, TeamError, TeamHost, clean_name
 
-APP_NAME = "Dogani"
-CONFIG_DIR = os.environ.get("DOGANI_HOME") or os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Dogani")
+APP_NAME = "dogani"
+CONFIG_DIR = os.environ.get("DOGANI_HOME") or os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "dogani")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "dogani.json")
-TEAM_DIR = os.path.join(CONFIG_DIR, "team")
+TEAM_DIR = os.path.join(CONFIG_DIR, "team")   # 팀 호스트의 서명 키·초대장 (볼트 id 별). 예전엔 팀 데이터 전부
+LEGACY_TEAM_VAULT = os.path.join(TEAM_DIR, "notes")   # v26.11.10 이전 공용 노트 폴더 = 기본 팀 볼트
+RECENT_MAX = 10
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # exe 면 런처(launcher.py)가 고른 코드 폴더
 UI_DIR = os.path.join(BASE_DIR, "ui")
 DEFAULT_PORT = 8765
 OPACITY_LEVELS = [100, 90, 80, 70, 60]
 ME = "me"      # 내 노트 공간 키
-TEAM = "team"  # 공용 공간 키 (팀원은 "m:팀원ID", 주소로 추가한 사람은 "ip:port")
+TEAM = "team"  # 팀 볼트 공간 키
 TEAM_POLL_MS = 20_000
 
-STATUS_LABELS = {
-    "online": "접속 중",
-    "offline": "연결 끊김",
-    "paused": "공유 일시 중지됨",
-    "blocked": "차단됨",
-    "team_only": "팀원만 볼 수 있음",
-}
 TEAM_STATUS = {"online": "연결됨", "offline": "호스트 연결 끊김", "logged_out": "다시 로그인 필요"}
 
 EMPTY_TEAM = {"host": "", "token": "", "id": "", "pub": "", "team": "", "members": []}
 DEFAULT_CONFIG = {
     "port": DEFAULT_PORT,
-    "todo_dir": "",
-    "name": "",           # 내 이름 (팀원·동료에게 보이는 이름)
-    "paused": False,      # 내 노트 공유 일시 중지
-    "team_only": True,    # 팀에 들어 있으면 팀원에게만 내 노트 공유
-    "blocked": [],
-    "servers": [],        # 주소로 직접 추가한 사람 ["192.168.0.10:8765", ...]
+    "vault": "",          # 지금 연 내 볼트 (폴더)
+    "vaults": [],         # 최근 연 볼트 (최근 것 먼저)
+    "name": "",           # 내 이름 (팀원에게 보이는 이름)
     "team": dict(EMPTY_TEAM),
     "team_host": False,   # 이 PC 가 팀 호스트
+    "team_vault": "",     # 팀 호스트일 때 팀 볼트 폴더
     "visible": True,
     "space": ME,          # 지금 보고 있는 공간
     "windows": {},        # nav / note / cal -> {"pos", "panel", "open"}
@@ -95,6 +89,18 @@ def load_config():
     cfg["team"] = {**EMPTY_TEAM, **(cfg.get("team") or {})}
     cfg["team"].pop("secret", None)   # 예전 HMAC 비밀키 (위조에 쓰일 수 있어 폐기)
     migrate_windows(cfg)
+    # v26.11.10 이전: todo 폴더 + 내 노트 공유(일시 중지·차단·팀원 전용·주소 추가) → 볼트, 공유 없음
+    old_dir = cfg.pop("todo_dir", "")
+    if old_dir and not cfg["vault"]:
+        cfg["vault"] = old_dir
+    for k in ("paused", "team_only", "blocked", "servers"):
+        cfg.pop(k, None)
+    if cfg["team_host"] and not cfg["team_vault"]:
+        cfg["team_vault"] = LEGACY_TEAM_VAULT
+    if cfg["space"] not in (ME, TEAM):
+        cfg["space"] = ME
+    if cfg["vault"] and cfg["vault"] not in cfg["vaults"]:
+        cfg["vaults"].insert(0, cfg["vault"])
     if not cfg["name"]:
         cfg["name"] = clean_name(socket.gethostname() or os.environ.get("USERNAME"))   # 처음엔 PC 이름
     return cfg
@@ -137,6 +143,10 @@ def save_config(cfg):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     os.replace(tmp, CONFIG_PATH)
+
+
+def remember_vault(cfg, path):
+    cfg["vaults"] = ([path] + [v for v in cfg["vaults"] if os.path.normcase(v) != os.path.normcase(path)])[:RECENT_MAX]
 
 
 def normalize_server(text):
@@ -211,7 +221,7 @@ def set_autostart(enable):
 
 
 def migrate_autostart():
-    """예전 DoganiServer/DoganiClient 자동 실행 항목이 있으면 지우고 Dogani 로 바꾼다."""
+    """예전 DoganiServer/DoganiClient 자동 실행 항목이 있으면 지우고 dogani 로 바꾼다."""
     found = False
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_ALL_ACCESS) as key:
@@ -271,7 +281,7 @@ def get_owner(hwnd):
 
 
 # ---------------------------------------------------------------- tray
-ICON_COLORS = {"sharing": (46, 160, 67), "paused": (230, 145, 30), "off": (150, 150, 150)}
+ICON_COLORS = {"on": (46, 160, 67), "off": (150, 150, 150)}
 
 
 def make_icon_image(color):
@@ -306,48 +316,18 @@ class Tray(QObject):
         # pystray 는 콜백 인자 개수(0~2개)를 검사하므로 기본값 인자를 쓰면 안 된다
         return lambda icon, item: self.command.emit(name, arg)
 
-    def client_items(self):
+    def vault_items(self):
         Item = pystray.MenuItem
-        share = self.app.share
-        if not share:
-            return [Item("(공유 서버 꺼짐)", None, enabled=False)]
-        clients, blocked = share.hub.snapshot()
-        items = []
-        order = sorted(clients.items(), key=lambda kv: (kv[1]["active"] == 0, -kv[1]["last_seen"]))
-        for ip, c in order:
-            if ip in blocked:
-                continue
-            who = c.get("user") or c["host"]
-            name = f"{who} ({ip})" if who else ip
-            if not c["active"]:
-                name += f"  - 마지막 {time.strftime('%m/%d %H:%M', time.localtime(c['last_seen']))}"
-            items.append(Item(name, pystray.Menu(Item("연결 끊고 차단", self.emit("block", ip))),
-                              checked=lambda i, a=c["active"]: a > 0, radio=True))
-        if blocked:
-            if items:
-                items.append(pystray.Menu.SEPARATOR)
-            for ip in sorted(blocked):
-                c = clients.get(ip, {})
-                who = c.get("user") or c.get("host", "")
-                items.append(Item(f"[차단됨] {ip}" + (f" ({who})" if who else ""),
-                                  pystray.Menu(Item("차단 해제", self.emit("unblock", ip)))))
-        return items or [Item("(접속 기록 없음)", None, enabled=False)]
-
-    def server_items(self):
-        Item = pystray.MenuItem
-        app = self.app
-        items = []
-        for addr in app.cfg["servers"]:
-            name = app.names.get(addr)
-            label = f"{name} ({addr})" if name else addr
-            label += f"  - {STATUS_LABELS.get(app.status.get(addr, 'offline'), '')}"
-            items.append(Item(label, pystray.Menu(
-                Item("보기", self.emit("select_space", addr)),
-                Item("삭제", self.emit("remove_server", addr)),
-            )))
+        cfg = self.app.cfg
+        items = [Item(f"{vault.vault_name(v)}  ({v})", self.emit("switch_vault", v),
+                      checked=lambda i, v=v: v == cfg["vault"], radio=True)
+                 for v in cfg["vaults"]]
         if items:
             items.append(pystray.Menu.SEPARATOR)
-        items.append(Item("추가...", self.emit("add_server")))
+        items += [Item("폴더 열기 (탐색기)", self.emit("open_dir"), enabled=bool(cfg["vault"])),
+                  Item("볼트 열기...", self.emit("browse_dir"))]
+        if len(cfg["vaults"]) > 1:
+            items.append(Item("최근 목록 정리 (지금 볼트만 남김)", self.emit("clear_vaults")))
         return items
 
     def member_items(self):
@@ -391,7 +371,7 @@ class Tray(QObject):
                 pystray.Menu.SEPARATOR,
                 Item("팀원", pystray.Menu(lambda: self.member_items())),
                 Item("팀 이름 바꾸기...", self.emit("rename_team")),
-                Item("공용 폴더 열기", self.emit("open_team_dir")),
+                Item(f"팀 볼트 폴더 열기 ({team.root})", self.emit("open_team_dir")),
                 pystray.Menu.SEPARATOR,
                 Item("팀 호스트 끄기", self.emit("stop_host")),
             )
@@ -405,27 +385,14 @@ class Tray(QObject):
         return pystray.Menu(
             Item("팀 참여... (초대장)", self.emit("join_team")),
             pystray.Menu.SEPARATOR,
-            Item("이 PC 를 팀 호스트로 (새 팀 만들기)", self.emit("start_host"), enabled=bool(app.share)),
+            Item("이 PC 를 팀 호스트로 (팀 볼트 폴더 고르기)...", self.emit("start_host"), enabled=bool(app.share)),
         )
 
     def build_menu(self):
         Item = pystray.MenuItem
         app, cfg = self.app, self.app.cfg
         share = app.share
-        if share:
-            share_label = "공유 일시 중지됨" if share.paused else "공유 중"
-            share_menu = pystray.Menu(
-                Item(f"{share.address}  (클릭 시 주소 복사)", self.emit("copy_address")),
-                pystray.Menu.SEPARATOR,
-                Item("공유 일시 중지", self.emit("toggle_pause"), checked=lambda i: share.paused),
-                Item("팀원에게만 공유", self.emit("toggle_team_only"), checked=lambda i: cfg["team_only"],
-                     enabled=app.in_team()),
-                Item("접속자", pystray.Menu(lambda: self.client_items())),
-            )
-        else:
-            share_label = "공유 꺼짐 (포트 사용 중)"
-            share_menu = pystray.Menu(Item(f"포트 {cfg['port']}을(를) 열 수 없습니다", None, enabled=False))
-        todo_dir = cfg["todo_dir"] or "(경로 미지정)"
+        vault_label = f"볼트: {vault.vault_name(cfg['vault'])}" if cfg["vault"] else "볼트: (안 열림)"
         if share and share.team:
             team_label = f"팀스페이스: {share.team.name} (호스트)"
         elif cfg["team"].get("token"):
@@ -433,17 +400,11 @@ class Tray(QObject):
         else:
             team_label = "팀스페이스: 참여 안 함"
         return [
-            Item("Dogani 표시", self.emit("toggle_visible"), checked=lambda i: cfg["visible"], default=True),
+            Item("dogani 표시", self.emit("toggle_visible"), checked=lambda i: cfg["visible"], default=True),
             Item(f"내 이름: {cfg['name']}", pystray.Menu(Item("이름 바꾸기...", self.emit("rename")))),
             Item(team_label, self.team_menu()),
             pystray.Menu.SEPARATOR,
-            Item(f"내 노트 {share_label}", share_menu, checked=lambda i: bool(share) and not share.paused, radio=True),
-            Item("todo 경로", pystray.Menu(
-                Item(todo_dir, self.emit("open_dir")),
-                pystray.Menu.SEPARATOR,
-                Item("찾아보기...", self.emit("browse_dir")),
-            )),
-            Item("주소로 추가한 노트", pystray.Menu(lambda: self.server_items())),
+            Item(vault_label, pystray.Menu(lambda: self.vault_items())),
             pystray.Menu.SEPARATOR,
             Item("바탕화면에 고정", self.emit("set_on_top", False), checked=lambda i: not cfg["on_top"], radio=True),
             Item("항상 위에 표시", self.emit("set_on_top", True), checked=lambda i: cfg["on_top"], radio=True),
@@ -461,13 +422,11 @@ class Tray(QObject):
 
     def update(self):
         share = self.app.share
-        key = "off" if not share else "paused" if share.paused else "sharing"
-        self.icon.icon = make_icon_image(ICON_COLORS[key])
+        self.icon.icon = make_icon_image(ICON_COLORS["on" if share else "off"])
         if share:
-            state = "공유 일시 중지" if share.paused else "공유 중"
-            self.icon.title = f"Dogani {liveupdate.version_text()} - {self.app.cfg['name']} {share.address} ({state})"
+            self.icon.title = f"dogani {liveupdate.version_text()} - {vault.vault_name(self.app.cfg['vault'])}"
         else:
-            self.icon.title = "Dogani - 내 노트 공유 꺼짐"
+            self.icon.title = f"dogani - 포트 {self.app.cfg['port']} 사용 중 (볼트를 열 수 없음)"
 
     def notify(self, text):
         try:
@@ -554,7 +513,7 @@ class Bridge(QObject):
 
     @Slot(str, str)
     def setStatus(self, key, status):
-        if status in STATUS_LABELS:
+        if status in ("online", "offline", "blocked"):
             self.win.app.on_status(key, status)
 
     @Slot(str, str)
@@ -588,7 +547,7 @@ class Bridge(QObject):
 
     @Slot(str)
     def action(self, name):
-        if name in ("join_team", "rename", "add_server", "start_host"):
+        if name in ("join_team", "rename", "browse_dir", "start_host"):
             self.win.app.on_command(name, None)
 
     @Slot(str)
@@ -629,7 +588,7 @@ class UiSchemeHandler(QWebEngineUrlSchemeHandler):
 
 
 class ClientHeaders(QWebEngineUrlRequestInterceptor):
-    """서버로 가는 모든 요청(fetch, SSE)에 Dogani 식별 헤더 + 내 이름 + 팀원 토큰을 붙인다."""
+    """서버로 가는 모든 요청(fetch, SSE)에 dogani 식별 헤더 + 내 이름 + 팀원 토큰을 붙인다."""
 
     def __init__(self, app):
         super().__init__(app)
@@ -908,13 +867,23 @@ class Overlay(QWidget):
 
 
 # ---------------------------------------------------------------- app
+def overlaps(a, b):
+    """두 폴더가 같거나 한쪽이 다른 쪽 안에 있음"""
+    a, b = os.path.normcase(os.path.abspath(a)), os.path.normcase(os.path.abspath(b))
+    try:
+        common = os.path.commonpath([a, b])
+    except ValueError:   # 다른 드라이브
+        return False
+    return common in (a, b)
+
+
 def screen_key(screen):
     """모니터 식별자: 연결 순서에 따라 바뀌는 DISPLAYn 대신 제조사·모델·일련번호 우선."""
     key = " ".join(p for p in (screen.manufacturer(), screen.model(), screen.serialNumber()) if p).strip()
     return key or screen.name()
 
 
-class DoganiApp(QObject):
+class doganiApp(QObject):
     team_result = Signal(int, object)   # 팀 호스트 응답 (작업 스레드 → 메인 스레드)
 
     def __init__(self, qapp, cfg):
@@ -922,7 +891,6 @@ class DoganiApp(QObject):
         self.qapp = qapp
         self.cfg = cfg
         self.status = {}     # 공간 키 -> 창에서 알려 준 연결 상태
-        self.names = {}      # 주소로 추가한 사람 -> 상대가 알려 준 이름
         self.nav = None      # 네비게이션 바 (하나)
         self.panels = {}     # "note" | "cal" -> Overlay
         self.note_label = None   # 할일 창이 보여주는 날짜 {date, title, today}
@@ -937,8 +905,8 @@ class DoganiApp(QObject):
         qapp.primaryScreenChanged.connect(self.on_screens_changed)
         setup_profile(self)
 
-        self.share = ShareServer(cfg["port"], cfg["todo_dir"], cfg["paused"], cfg["blocked"], cfg["name"])
-        self.share.team_only = cfg["team_only"]
+        self.open_vault_meta(cfg["vault"])
+        self.share = ShareServer(cfg["port"], cfg["vault"], cfg["name"])
         try:
             self.share.start()
         except OSError:
@@ -983,26 +951,10 @@ class DoganiApp(QObject):
                         "prefix": "/api/team", "kind": "team",
                         "status": (self.status.get(TEAM) or "online") if self.team_status == "online" else
                         ("blocked" if self.team_status == "logged_out" else "offline")})
-        out.append({"key": ME, "group": "me", "name": cfg["name"], "server": f"127.0.0.1:{cfg['port']}",
+        out.append({"key": ME, "group": "me", "name": vault.vault_name(cfg["vault"]) or cfg["name"],
+                    "server": f"127.0.0.1:{cfg['port']}",
                     "prefix": "/api", "kind": "me", "status": "online" if self.share else "offline",
-                    "sub": "" if self.share else "공유 꺼짐"})
-        seen = set()
-        for m in t.get("members") or []:
-            if m["id"] == t.get("id"):
-                continue
-            addr = m.get("addr", "")
-            seen.add(addr)
-            key = "m:" + m["id"]
-            st = self.status.get(key) or ("online" if m.get("online") and addr else "offline")
-            out.append({"key": key, "group": "member", "name": m["name"], "server": addr, "prefix": "/api",
-                        "kind": "peer", "status": st if m.get("online") else "offline",
-                        "sub": "" if addr else "노트 공유 안 함", "disabled": not addr})
-        for addr in cfg["servers"]:
-            if addr in seen:
-                continue
-            out.append({"key": addr, "group": "other", "name": self.names.get(addr) or addr.removesuffix(f":{DEFAULT_PORT}"),
-                        "server": addr, "prefix": "/api", "kind": "peer",
-                        "status": self.status.get(addr, "offline"), "sub": addr})
+                    "sub": "" if self.share else "포트 사용 중"})
         for s in out:
             s["status"] = s.get("status") or "offline"
         return out
@@ -1048,16 +1000,11 @@ class DoganiApp(QObject):
             self.nav.push_config(spaces=self.spaces())
 
     def on_peer_name(self, key, name):
-        if name and key in self.cfg["servers"] and self.names.get(key) != name:
-            self.names[key] = name
-            self.push_spaces()
+        pass   # 예전 '주소로 추가한 노트' 이름 표시용 (지금은 쓰지 않음)
 
     # ------------------------------------------------------------ team (client)
     def apply_team_auth(self):
         if self.share:
-            t = self.cfg["team"]
-            self.share.auth.update(t.get("pub") if t.get("token") else "", t.get("members"), joined=bool(t.get("token")))
-            self.share.team_only = self.cfg["team_only"]
             self.share.name = self.cfg["name"]
 
     def poll_team(self):
@@ -1066,10 +1013,9 @@ class DoganiApp(QObject):
             return
         self.team_polling = True
         host, token, name = t["host"], t["token"], self.cfg["name"]
-        port = self.cfg["port"] if self.share else 0
 
         def work():
-            status, res = http_json(host, f"/api/team/me?port={port}", token=token, name=name)
+            status, res = http_json(host, "/api/team/me", token=token, name=name)
             self.team_result.emit(status, res)
 
         threading.Thread(target=work, daemon=True).start()
@@ -1108,7 +1054,7 @@ class DoganiApp(QObject):
         if status == 200:
             return True, res
         if status == 0:
-            return False, f"{host} 에 연결할 수 없습니다. 주소와 호스트 PC 의 Dogani 가 켜져 있는지 확인하세요."
+            return False, f"{host} 에 연결할 수 없습니다. 주소와 호스트 PC 의 dogani 가 켜져 있는지 확인하세요."
         if res.get("error") == "no_team":
             return False, "그 PC 는 팀 호스트가 아닙니다."
         return False, res.get("message") or f"실패했습니다. (HTTP {status})"
@@ -1157,27 +1103,59 @@ class DoganiApp(QObject):
                                 "다시 들어오려면 관리자에게 초대장을 받으세요.)") != QMessageBox.StandardButton.Yes:
             return
         self.cfg["team"] = dict(EMPTY_TEAM)
-        if self.cfg["space"] == TEAM or self.cfg["space"].startswith("m:"):
-            self.cfg["space"] = ME
+        self.cfg["space"] = ME
         self.apply_team_auth()
         self.push_spaces()
 
     # ------------------------------------------------------------ team (host)
+    def pick_team_vault(self):
+        """팀 볼트로 쓸 폴더 고르기 → 경로 또는 "" (내 볼트와 겹치면 안 됨: 개인 노트가 팀에 공개됨)"""
+        start = self.cfg["team_vault"] or (LEGACY_TEAM_VAULT if os.path.isdir(LEGACY_TEAM_VAULT) else os.path.expanduser("~"))
+        while True:
+            path = QFileDialog.getExistingDirectory(None, "팀 볼트 폴더 선택 (팀원 모두에게 공개·편집됨)", start)
+            if not path:
+                return ""
+            path = os.path.normpath(path)
+            mine = self.cfg["vault"]
+            if mine and overlaps(path, mine):
+                QMessageBox.warning(None, APP_NAME, "내 볼트와 겹치는 폴더는 팀 볼트로 쓸 수 없습니다.\n"
+                                    "(내 볼트 노트가 팀원에게 공개됨) 따로 빈 폴더를 만들어 고르세요.")
+                start = path
+                continue
+            return path
+
     def start_host(self, quiet=False):
         if not self.share:
             return
+        root = self.cfg["team_vault"]
         if not quiet:
             if self.in_team() and QMessageBox.question(
                     None, APP_NAME, "지금 들어가 있는 팀에서 로그아웃하고 이 PC 를 새 팀의 호스트로 만들까요?"
             ) != QMessageBox.StandardButton.Yes:
                 return
+            root = self.pick_team_vault()
+            if not root:
+                return
+        if self.cfg["vault"] and overlaps(root, self.cfg["vault"]):
+            QMessageBox.warning(None, APP_NAME, "내 볼트와 겹치는 폴더는 팀 볼트로 열 수 없습니다.\n"
+                                f"팀 볼트: {root}\n내 볼트: {self.cfg['vault']}")
+            return
+        if quiet and not os.path.isdir(root):
+            # 폴더가 옮겨졌거나 드라이브가 아직 안 붙음 → 새로 만들면 새 볼트 id·새 키 = 팀원 모두 로그아웃. 켜지 않고 알림
+            QMessageBox.warning(None, APP_NAME, f"팀 볼트 폴더가 없어 팀 호스트를 켜지 않았습니다.\n{root}\n\n"
+                                "폴더를 되돌린 뒤 다시 실행하거나, 트레이 > 팀스페이스 에서 다시 고르세요.")
+            return
+        # 예전 팀 데이터(team\team.json)는 예전 공용 노트 폴더를 팀 볼트로 열 때만 가져옴 (노트와 팀원이 갈라지지 않게)
+        legacy = TEAM_DIR if os.path.normcase(os.path.abspath(root)) == os.path.normcase(os.path.abspath(LEGACY_TEAM_VAULT)) else None
         try:
-            host = TeamHost(TEAM_DIR, self.cfg["name"])
+            os.makedirs(root, exist_ok=True)
+            host = TeamHost(root, TEAM_DIR, self.cfg["name"], legacy_dir=legacy)
         except OSError as e:
-            QMessageBox.warning(None, APP_NAME, f"팀 폴더를 만들 수 없습니다.\n{e}")
+            QMessageBox.warning(None, APP_NAME, f"팀 볼트를 열 수 없습니다.\n{e}")
             return
         self.share.team = host
         self.cfg["team_host"] = True
+        self.cfg["team_vault"] = root
         owner = next(m for m in host.members() if m["id"] == host.owner_id)
         self.cfg["name"] = owner["name"]
         self.set_session(f"127.0.0.1:{self.cfg['port']}",
@@ -1193,20 +1171,19 @@ class DoganiApp(QObject):
 
     def stop_host(self):
         if QMessageBox.question(None, APP_NAME, "팀 호스트를 끌까요?\n팀원들은 공용 공간을 볼 수 없게 됩니다.\n"
-                                f"(데이터는 {TEAM_DIR} 에 남아 있어서 다시 켜면 그대로 돌아옵니다.)"
+                                f"(팀 볼트 {self.cfg['team_vault']} 와 키는 남아 있어서 다시 켜면 그대로 돌아옵니다.)"
                                 ) != QMessageBox.StandardButton.Yes:
             return
         if self.share:
             self.share.team = None
         self.cfg["team_host"] = False
         self.cfg["team"] = dict(EMPTY_TEAM)
-        if self.cfg["space"] != ME:
-            self.cfg["space"] = ME
+        self.cfg["space"] = ME
         self.apply_team_auth()
         self.push_spaces()
 
     def rename(self):
-        name, ok = QInputDialog.getText(None, "내 이름", "팀원·동료에게 보이는 이름 (최대 20자)",
+        name, ok = QInputDialog.getText(None, "내 이름", "팀원에게 보이는 이름 (최대 20자)",
                                         QLineEdit.EchoMode.Normal, self.cfg["name"])
         name = clean_name(name) if ok else ""
         if not name or name == self.cfg["name"]:
@@ -1308,47 +1285,48 @@ class DoganiApp(QObject):
         self.team_timer.start()
         self.poll_team()
         if not self.share:
-            self.tray.notify(f"포트 {self.cfg['port']}이(가) 사용 중이라 내 노트를 공유할 수 없습니다.\n"
+            self.tray.notify(f"포트 {self.cfg['port']}이(가) 사용 중이라 볼트를 열 수 없습니다.\n"
                              "예전 DoganiServer 가 켜져 있다면 종료하고 다시 실행하세요.")
-        elif not self.cfg["todo_dir"]:
+        elif not self.cfg["vault"]:
             QTimer.singleShot(500, self.browse_dir)
 
     # ------------------------------------------------------------ actions
+    def open_vault_meta(self, path):
+        """볼트 표시(.dogani/vault.json) 만들기. 폴더가 없으면(USB·네트워크 드라이브 등) 조용히 넘어감"""
+        try:
+            return vault.open_vault(path) if path else None
+        except OSError:
+            return None
+
     def browse_dir(self):
         path = QFileDialog.getExistingDirectory(
-            None, "todo(데일리 노트) 폴더 선택  예) 선택폴더/2026.11/261102 월.md",
-            self.cfg["todo_dir"] or os.path.expanduser("~"))
+            None, "볼트 열기 (노트 폴더)  예) 폴더/2026.11/261102 월.md",
+            self.cfg["vault"] or os.path.expanduser("~"))
         if path:
-            path = os.path.normpath(path)
-            if path != self.cfg["todo_dir"]:
-                self.cfg["todo_dir"] = path
-                if self.share:
-                    self.share.set_root(path)
+            self.switch_vault(os.path.normpath(path))
 
-    def add_server(self):
-        text, ok = QInputDialog.getText(
-            None, "주소로 노트 추가",
-            f"팀원이 아닌 사람의 Dogani 주소 (IP 또는 IP:포트, 기본 포트 {DEFAULT_PORT})\n"
-            "팀원은 팀에 들어오면 자동으로 목록에 나옵니다.",
-            QLineEdit.EchoMode.Normal, "")
-        addr = normalize_server(text) if ok else ""
-        if not addr:
+    def switch_vault(self, path):
+        team_root = self.share.team.root if self.share and self.share.team else ""
+        if team_root and overlaps(path, team_root):
+            QMessageBox.warning(None, APP_NAME, "팀 볼트와 겹치는 폴더는 내 볼트로 열 수 없습니다.\n"
+                                "(팀 볼트는 바의 공간 선택에서 '공용'으로 보세요)")
             return
-        if addr not in self.cfg["servers"]:
-            self.cfg["servers"].append(addr)
-        self.cfg["space"] = addr
-        self.push_spaces()
-
-    def remove_server(self, addr):
-        if QMessageBox.question(None, APP_NAME, f"{addr} 노트를 목록에서 삭제할까요?") != QMessageBox.StandardButton.Yes:
+        if not os.path.isdir(path):
+            if QMessageBox.question(None, APP_NAME, f"폴더가 없습니다.\n{path}\n\n최근 목록에서 뺄까요?"
+                                    ) == QMessageBox.StandardButton.Yes:
+                self.cfg["vaults"] = [v for v in self.cfg["vaults"] if os.path.normcase(v) != os.path.normcase(path)]
+                save_config(self.cfg)
             return
-        if addr in self.cfg["servers"]:
-            self.cfg["servers"].remove(addr)
-        self.status.pop(addr, None)
-        self.names.pop(addr, None)
-        if self.cfg["space"] == addr:
+        self.open_vault_meta(path)
+        remember_vault(self.cfg, path)
+        if path != self.cfg["vault"]:
+            self.cfg["vault"] = path
             self.cfg["space"] = ME
-        self.push_spaces()
+            if self.share:
+                self.share.set_root(path)
+            self.push_spaces()
+            self.tray.update()
+        save_config(self.cfg)
 
     def on_command(self, name, arg):
         cfg = self.cfg
@@ -1394,27 +1372,17 @@ class DoganiApp(QObject):
             if m and QMessageBox.question(None, APP_NAME, f"{m['name']} 님을 팀에서 내보낼까요?") == QMessageBox.StandardButton.Yes:
                 team.kick(arg)
                 self.poll_team()
-        elif name == "add_server":
-            self.add_server()
-        elif name == "remove_server":
-            self.remove_server(arg)
         elif name == "copy_address" and share:
             QGuiApplication.clipboard().setText(share.address)
-        elif name == "toggle_pause" and share:
-            share.set_paused(not share.paused)
-            cfg["paused"] = share.paused
-            self.tray.update()
-        elif name == "toggle_team_only":
-            cfg["team_only"] = not cfg["team_only"]
-            self.apply_team_auth()
-        elif name in ("block", "unblock") and share:
-            (share.hub.block if name == "block" else share.hub.unblock)(arg)
-            cfg["blocked"] = sorted(share.hub.snapshot()[1])
         elif name == "open_dir":
-            if cfg["todo_dir"] and os.path.isdir(cfg["todo_dir"]):
-                os.startfile(cfg["todo_dir"])
+            if cfg["vault"] and os.path.isdir(cfg["vault"]):
+                os.startfile(cfg["vault"])
         elif name == "browse_dir":
             self.browse_dir()
+        elif name == "switch_vault":
+            self.switch_vault(arg)
+        elif name == "clear_vaults":
+            cfg["vaults"] = [cfg["vault"]] if cfg["vault"] else []
         elif name == "set_on_top":
             cfg["on_top"] = arg
             for ov in self.windows():
@@ -1447,10 +1415,9 @@ def single_instance(name="DoganiMutex"):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Dogani - 옵시디언 todo 실시간 공유")
-    parser.add_argument("--dir", help="내 todo(데일리 노트) 폴더 경로")
-    parser.add_argument("--port", type=int, help=f"내 노트 공유 포트 (기본 {DEFAULT_PORT})")
-    parser.add_argument("--add", metavar="ADDR", action="append", help="다른 사람 주소 추가 (IP 또는 IP:포트)")
+    parser = argparse.ArgumentParser(description="dogani - 볼트 할일·일정 오버레이 + 팀 볼트")
+    parser.add_argument("--dir", help="열 볼트(노트 폴더) 경로")
+    parser.add_argument("--port", type=int, help=f"포트 (기본 {DEFAULT_PORT}, 팀 호스트 주소에 씀)")
     parser.add_argument("--name", help="내 이름")
     args = parser.parse_args()
 
@@ -1460,24 +1427,21 @@ def main():
 
     mutex = liveupdate.MUTEX = single_instance()
     if mutex is None:
-        QMessageBox.information(None, APP_NAME, "Dogani 가 이미 실행 중입니다.\n시스템 트레이를 확인하세요.")
+        QMessageBox.information(None, APP_NAME, "dogani 가 이미 실행 중입니다.\n시스템 트레이를 확인하세요.")
         return
 
     cfg = load_config()
     if args.dir:
-        cfg["todo_dir"] = os.path.abspath(args.dir)
+        cfg["vault"] = os.path.abspath(args.dir)
+        remember_vault(cfg, cfg["vault"])
     if args.port:
         cfg["port"] = args.port
     if args.name and clean_name(args.name):
         cfg["name"] = clean_name(args.name)
-    for addr in args.add or []:
-        addr = normalize_server(addr)
-        if addr and addr not in cfg["servers"]:
-            cfg["servers"].append(addr)
     save_config(cfg)
     migrate_autostart()
 
-    app = DoganiApp(qapp, cfg)
+    app = doganiApp(qapp, cfg)
     app.start()
     sys.exit(qapp.exec())
 

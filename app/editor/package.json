@@ -1,7 +1,7 @@
 {
   "name": "dogani-editor",
   "private": true,
-  "description": "Dogani 라이브 프리뷰 편집기 (CodeMirror 6) — build.cmd 로 ../ui/vendor/editor.js 생성",
+  "description": "dogani 라이브 프리뷰 편집기 (CodeMirror 6) — build.cmd 로 ../ui/vendor/editor.js 생성",
   "scripts": {
     "build": "build.bat"
   },

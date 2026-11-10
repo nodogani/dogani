@@ -1,6 +1,6 @@
 """
 dogani.exe 진입점 (런처). 이 파일만 exe 에 고정되고, 실제 프로그램 코드(dogani.py, ui/ ...)는
-%APPDATA%\\Dogani\\app 에 받아 둔 최신본을 실행한다. 받은 게 없거나 깨졌으면 exe 에 같이 넣은 기본 코드로 실행.
+%APPDATA%\\dogani\\app 에 받아 둔 최신본을 실행한다. 받은 게 없거나 깨졌으면 exe 에 같이 넣은 기본 코드로 실행.
 
 켤 때마다 (디스코드식)
   1) 지금 코드의 updater.py 로 GitHub 최신 태그를 확인해 새 버전이면 app.new 에 받고
@@ -18,7 +18,7 @@ import traceback
 
 import deps  # noqa: F401  PyInstaller 가 PySide6 등 의존성을 exe 에 넣도록
 
-CONFIG_DIR = os.environ.get("DOGANI_HOME") or os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Dogani")
+CONFIG_DIR = os.environ.get("DOGANI_HOME") or os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "dogani")
 CACHE_DIR = os.path.join(CONFIG_DIR, "app")
 STAGED_DIR = CACHE_DIR + ".new"
 BUNDLED_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "app")
