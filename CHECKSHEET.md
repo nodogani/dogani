@@ -1,6 +1,6 @@
 # CHECKSHEET.md
 
-> v26.11.10.02 커밋 시점에 완료된 내역은 [CHANGELOG.md](CHANGELOG.md)로 옮기고 지움. 아래는 남은 항목.
+> v26.11.10.03 커밋 시점에 완료된 내역은 [CHANGELOG.md](CHANGELOG.md)로 옮기고 지움. 아래는 남은 항목.
 
 ## 작업 내역 (미커밋)
 
