@@ -785,7 +785,30 @@ class Overlay(QWidget):
         if (get_owner(hwnd) or None) != (target or None):
             set_owner(hwnd, target)
 
+    def place_on_saved_screen(self):
+        """모니터별로 기억한 위치(작업 영역 기준 상대 좌표)로 옮김. 기억한 모니터가 없으면 주 모니터의 같은 상대 위치."""
+        rel = self.wcfg.get("screens") or {}
+        key = self.wcfg.get("screen")
+        if not key or key not in rel:
+            return False
+        screens = {screen_key(s): s for s in QGuiApplication.screens()}
+        screen = screens.get(key) or QGuiApplication.primaryScreen()
+        geo = screen.availableGeometry()
+        rx, ry = rel[key] if key in screens else rel.get(screen_key(screen), rel[key])
+        self._placing = True
+        try:
+            self.move(geo.left() + rx, geo.top() + ry)
+            self.keep_on_screen(QPoint(geo.left() + 1, geo.top() + 1) if self._off_screen() else None)
+        finally:
+            self._placing = False
+        return True
+
+    def _off_screen(self):
+        return QGuiApplication.screenAt(self.pos() + QPoint(30, 20)) is None
+
     def restore_position(self):
+        if self.place_on_saved_screen():
+            return
         pos = self.wcfg.get("pos")
         if pos and QGuiApplication.screenAt(QPoint(pos[0] + 30, pos[1] + 20)):
             self.move(pos[0], pos[1])
@@ -866,7 +889,15 @@ class Overlay(QWidget):
 
     def moveEvent(self, event):
         super().moveEvent(event)
+        if getattr(self, "_placing", False) or self.app.screens_changing:
+            return  # 모니터 연결/해제로 밀려난 이동은 기억하지 않음
         self.wcfg["pos"] = [self.x(), self.y()]
+        screen = QGuiApplication.screenAt(self.pos() + QPoint(30, 20))
+        if screen:
+            geo = screen.availableGeometry()
+            key = screen_key(screen)
+            self.wcfg.setdefault("screens", {})[key] = [self.x() - geo.left(), self.y() - geo.top()]
+            self.wcfg["screen"] = key
         self.app.save_later()
 
     def push_config(self, **values):
@@ -877,6 +908,12 @@ class Overlay(QWidget):
 
 
 # ---------------------------------------------------------------- app
+def screen_key(screen):
+    """모니터 식별자: 연결 순서에 따라 바뀌는 DISPLAYn 대신 제조사·모델·일련번호 우선."""
+    key = " ".join(p for p in (screen.manufacturer(), screen.model(), screen.serialNumber()) if p).strip()
+    return key or screen.name()
+
+
 class DoganiApp(QObject):
     team_result = Signal(int, object)   # 팀 호스트 응답 (작업 스레드 → 메인 스레드)
 
@@ -892,6 +929,12 @@ class DoganiApp(QObject):
         self.team_status = "offline"
         self.team_polling = False
         self.save_timer = QTimer(self, singleShot=True, interval=800, timeout=lambda: save_config(self.cfg))
+        # 모니터 연결/해제: Windows 가 창을 밀어 놓은 뒤 각 창을 기억한 모니터 기준 위치로 되돌림
+        self.screens_changing = False
+        self.screen_timer = QTimer(self, singleShot=True, interval=1500, timeout=self.on_screens_settled)
+        qapp.screenAdded.connect(self.on_screens_changed)
+        qapp.screenRemoved.connect(self.on_screens_changed)
+        qapp.primaryScreenChanged.connect(self.on_screens_changed)
         setup_profile(self)
 
         self.share = ShareServer(cfg["port"], cfg["todo_dir"], cfg["paused"], cfg["blocked"], cfg["name"])
@@ -912,6 +955,15 @@ class DoganiApp(QObject):
 
     def save_later(self):
         self.save_timer.start()
+
+    def on_screens_changed(self, *_):
+        self.screens_changing = True
+        self.screen_timer.start()
+
+    def on_screens_settled(self):
+        for ov in self.windows():
+            ov.place_on_saved_screen()
+        self.screens_changing = False
 
     def win_cfg(self, mode):
         return self.cfg["windows"].setdefault(mode, {"pos": None, "panel": None, "open": False})
